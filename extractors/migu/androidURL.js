@@ -1,9 +1,12 @@
-import { getStringMD5 } from "./EncryUtils.js";
+import { getStringMD5 } from "../../utils/EncryUtils.js";
 import { getddCalcuURL, getddCalcuURL720p } from "./ddCalcuURL.js";
-import { printDebug, printGreen, printRed, printYellow } from "./colorOut.js";
-import { fetchUrl } from "./net.js";
-import { delay } from "./fetchList.js";
-import { enableH265, enableHDR } from "../config.js";
+import { printDebug, printGreen, printRed, printYellow } from "../../utils/colorOut.js";
+import { fetchUrl } from "../../utils/net.js";
+import { delay } from "../../utils/fetchList.js";
+// 画质开关的默认来源。模块化之后它们由 migu 模块的 configSchema 提供、经 opts 传进来；
+// 这里保留 import 作为默认值，让根目录那个一次性脚本 fetchURLByAndroid720p.js
+// （直接调 getAndroidURL720p(pid)、不传 opts）继续可用，也便于回滚。
+import { enableH265, enableHDR } from "../../config.js";
 import fetch from 'node-fetch';
 
 /**
@@ -34,7 +37,19 @@ function getSaltAndSign(md5) {
  * @param {number} rateType - 清晰度
  * @returns {} - 
  */
-async function getAndroidURL(userId, token, pid, rateType) {
+// 咪咕 playurl 接口请求失败的统一收敛（用户日志截图反馈）：
+// fetchUrl 在超时/网络不通/非 JSON 响应时返回 undefined，部分风控/限流响应则没有 body 字段——
+// 此前直接读 respData.rid / respData.body 会抛 "Cannot read properties of undefined" 刷日志。
+// 统一返回干净的失败结果：channel() 会把 message 展示出来并按 1 分钟短缓存自动重试。
+function miguFetchFail(respData) {
+  const message = (respData && (respData.message || respData.desc))
+    || "咪咕接口请求失败：网络超时或不可达（服务器挂代理、海外部署、DNS 异常最常见），请检查服务器到 miguvideo.com 的网络"
+  return { url: "", rateType: 0, content: { message, raw: respData } }
+}
+
+async function getAndroidURL(userId, token, pid, rateType, opts = {}) {
+  const useHDR = opts.enableHDR ?? enableHDR
+  const useH265 = opts.enableH265 ?? enableH265
 
   if (rateType <= 1) {
     return {
@@ -66,11 +81,11 @@ async function getAndroidURL(userId, token, pid, rateType) {
   const result = getSaltAndSign(md5)
 
   let enableHDRStr = ""
-  if (enableHDR) {
+  if (useHDR) {
     enableHDRStr = "&4kvivid=true&2Kvivid=true&vivid=2"
   }
   let enableH265Str = ""
-  if (enableH265) {
+  if (useH265) {
     enableH265Str = "&h265N=true"
   }
   // 请求
@@ -85,6 +100,7 @@ async function getAndroidURL(userId, token, pid, rateType) {
 
   printDebug(respData)
 
+  if (!respData) return miguFetchFail(respData)
   if (respData.rid == 'TIPS_NEED_MEMBER') {
     printYellow("该账号没有会员 正在降低画质")
     let respRateType = parseInt(respData.body.urlInfo?.rateType) > 4 ? 4 : 3
@@ -96,6 +112,7 @@ async function getAndroidURL(userId, token, pid, rateType) {
       headers: headers
     })
 
+    if (!respData) return miguFetchFail(respData)
     if (respData.rid == 'TIPS_NEED_MEMBER') {
       printYellow("账号非钻石会员 降低画质")
 
@@ -111,6 +128,7 @@ async function getAndroidURL(userId, token, pid, rateType) {
 
   printDebug(respData)
   // console.log(respData)
+  if (!respData || !respData.body) return miguFetchFail(respData)
   const url = respData.body.urlInfo?.url
   // console.log(rateType)
   // console.log(url)
@@ -121,7 +139,7 @@ async function getAndroidURL(userId, token, pid, rateType) {
       content: respData
     }
   }
-  pid = respData.body.content.contId
+  pid = respData.body.content?.contId || pid
 
   // 将URL加密
   const resURL = getddCalcuURL(url, pid, "android", rateType, userId)
@@ -142,7 +160,9 @@ async function getAndroidURL(userId, token, pid, rateType) {
  * @param {string} pid - 节目ID
  * @returns {} - 
  */
-async function getAndroidURL720p(pid) {
+async function getAndroidURL720p(pid, opts = {}) {
+  const useHDR = opts.enableHDR ?? enableHDR
+  const useH265 = opts.enableH265 ?? enableH265
   // 获取url
   const timestramp = Math.round(Date.now()).toString()
   const appVersion = "2600034600"
@@ -166,11 +186,11 @@ async function getAndroidURL720p(pid) {
 
   let rateType = 3
   let enableHDRStr = ""
-  if (enableHDR) {
+  if (useHDR) {
     enableHDRStr = "&4kvivid=true&2Kvivid=true&vivid=2"
   }
   let enableH265Str = ""
-  if (enableH265) {
+  if (useH265) {
     enableH265Str = "&h265N=true"
   }
   // 请求
@@ -185,6 +205,7 @@ async function getAndroidURL720p(pid) {
 
   printDebug(respData)
   // console.dir(respData, { depth: null })
+  if (!respData || !respData.body) return miguFetchFail(respData)
   const url = respData.body.urlInfo?.url
   // console.log(rateType)
   // console.log(url)
@@ -197,7 +218,7 @@ async function getAndroidURL720p(pid) {
   }
 
   rateType = respData.body.urlInfo?.rateType
-  pid = respData.body.content.contId
+  pid = respData.body.content?.contId || pid
 
   // 将URL加密
   const resURL = getddCalcuURL720p(url, pid)
@@ -260,7 +281,11 @@ async function get302URL(resObj) {
 }
 
 function printLoginInfo(resObj) {
-  if (resObj.content.body?.auth?.logined) {
+  // content 可能是 null——rateType <= 1 时 getAndroidURL 直接返回 {url:"", content:null}
+  // （见本文件 :49-55）。而调用点 utils/appUtils.js:293 在 try 之外，app.js 的
+  // 请求 handler 也没有顶层 try，于是这里一个 TypeError 就让请求永远不 end：
+  // 客户端挂死到超时，服务端只在 unhandledRejection 留一行日志。
+  if (resObj?.content?.body?.auth?.logined) {
     printGreen("登录认证成功")
     if (resObj.content.body.auth.authResult == "FAIL") {
       printRed(`认证失败 视频内容不完整 可能缺少相关VIP: ${resObj.content.body.auth.resultDesc}`)

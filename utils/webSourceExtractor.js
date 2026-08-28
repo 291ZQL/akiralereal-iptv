@@ -39,12 +39,26 @@ function findSystemChrome() {
  * @param {boolean} headless
  */
 async function launchBrowser(headless) {
-  const baseArgs = ['--no-sandbox', '--disable-setuid-sandbox']
+  // --disable-blink-features=AutomationControlled：部分站点（如 vtvgo.vn，邮件反馈）检测到
+  // 自动化特征后直接不渲染页面（白屏），关掉该特征让无头抓取与真实浏览器行为一致；
+  // --autoplay-policy：允许播放器免手势自动起播（多数直播页要起播才发起 m3u8 请求）
+  const baseArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--autoplay-policy=no-user-gesture-required']
 
   // 1) 显式指定
+  //
+  // 必须包 try：这里若直接 return，显式路径不可用时后面三级回退一级都不会走。
+  // 真实会踩到的两种情况：
+  //   - arm/v6 镜像里 Alpine 没有 chromium 包（apk 那行有 `|| echo` 静默跳过），
+  //     而 Dockerfile 仍设了 PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+  //   - 用户自己把 mchromePath 填错
+  // 两种都会让抓取型的源彻底不可用，而报的是 puppeteer 的 ENOENT，看不懂。
   const explicit = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.mchromePath
   if (explicit) {
-    return puppeteer.launch({ headless, args: baseArgs, executablePath: explicit })
+    try {
+      return await puppeteer.launch({ headless, args: baseArgs, executablePath: explicit })
+    } catch (err) {
+      printRed(`指定的浏览器不可用(${explicit})，改用系统/自带浏览器: ${(err?.message || err).split('\n')[0]}`)
+    }
   }
 
   // 2) 系统已安装的浏览器
@@ -65,7 +79,18 @@ async function launchBrowser(headless) {
   } catch (err) {
     if (/Could not find Chrome|Browser was not found|Failed to launch|Could not find expected browser/i.test(err?.message || '')) {
       printRed('puppeteer 自带 Chrome 不可用，尝试 channel: chrome…')
-      return puppeteer.launch({ headless, args: baseArgs, channel: 'chrome' })
+      try {
+        return await puppeteer.launch({ headless, args: baseArgs, channel: 'chrome' })
+      } catch (lastErr) {
+        // 四级都试过了。报一句人能看懂的话——原始错误是 puppeteer 的 ENOENT，
+        // 用户从中看不出「这台机器/这个架构根本没有浏览器」。
+        throw new Error(
+          '找不到可用的 Chrome/Chromium，网页抓取型的源无法工作。'
+          + '容器部署请确认镜像内 /usr/bin/chromium 存在（部分架构如 arm/v6 的 Alpine 没有该包）；'
+          + '裸跑请安装 Chrome，或用 mchromePath 指定路径。'
+          + `原始错误: ${(lastErr?.message || lastErr).split('\n')[0]}`
+        )
+      }
     }
     throw err
   }
@@ -126,9 +151,11 @@ async function extractM3u8FromWeb(url, options = {}) {
     browser = await launchBrowser(headless)
     
     const page = await browser.newPage()
-    
-    // 设置用户代理
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+
+    // 隐藏 webdriver 指纹 + 使用完整版 Chrome UA：navigator.webdriver=true 和
+    // 裸 UA（没有 Chrome/xx 版本号）是站点识别无头爬虫的两大特征，命中后有的站直接白屏（vtvgo.vn 实测）
+    await page.evaluateOnNewDocument(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }) })
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
     
     // 监听网络请求，捕获 m3u8 链接
     const m3u8Links = []
@@ -165,9 +192,33 @@ async function extractM3u8FromWeb(url, options = {}) {
     }
     
     // 等待 m3u8 链接出现
-    printBlue(`等待 m3u8 链接...`)  
+    printBlue(`等待 m3u8 链接...`)
     await new Promise(resolve => setTimeout(resolve, waitTime))
-    
+
+    // 仍没嗅探到 m3u8：多数直播页要一次「播放」动作才开始拉流。未配置播放按钮选择器时，
+    // 兜底尝试常见播放器的播放按钮，或直接对 video 元素静音起播，再多等几秒
+    if (m3u8Links.length === 0 && !playButtonSelector) {
+      const triggered = await page.evaluate(() => {
+        const selectors = ['.vjs-big-play-button', '.jw-display-icon-display', '.dplayer-play-icon', '[class*="btn-play"]', '[class*="play-btn"]', '[class*="play_btn"]']
+        for (const s of selectors) {
+          const el = document.querySelector(s)
+          if (el) { el.click(); return s }
+        }
+        const v = document.querySelector('video')
+        if (v) {
+          v.muted = true
+          const p = v.play()
+          if (p && p.catch) p.catch(() => {})
+          return 'video.play()'
+        }
+        return null
+      }).catch(() => null)
+      if (triggered) {
+        printBlue(`尝试触发播放: ${triggered}`)
+        await new Promise(resolve => setTimeout(resolve, 4000))
+      }
+    }
+
     // 也可以尝试查找页面中的 m3u8 链接。URL 里不可能出现原始的 "<>\"'" 字符，用它们
     // 作为边界，避免把地址后面的引号/标签一起吞进来。
     const { videoSrcLinks, textLinks } = await page.evaluate(() => {

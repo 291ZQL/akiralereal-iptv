@@ -1,20 +1,105 @@
-import { get302URL, getAndroidURL, getAndroidURL720p, printLoginInfo } from "./androidURL.js";
 import { readFileSync } from "./fileUtil.js";
 import { dataPath } from "./paths.js";
-import { host, pass, rateType, token, userId, enableTvgNormalize } from "../config.js";
+import { host, pass, enableTvgNormalize } from "../config.js";
 import { printDebug, printGreen, printGrey, printRed, printYellow } from "./colorOut.js";
 import { readConfig, parseInterfaceTxt, applyConfig, generateM3u8, generateTxt } from "./playlistConfig.js";
+import { resolverFor, listModules } from "../extractors/registry.js";
+import { getExtractorManager, getModuleConfig } from "./extractorManager.js";
 
-// url缓存 降低请求频率（按 pid 缓存咪咕解析出的播放地址，默认 3 小时）
-const urlCache = {}
-
-// 清空咪咕地址缓存：H265/HDR/清晰度等配置变更后调用，让新设置「即时生效」，
-// 不必等旧缓存过期（3h）或重启容器——旧缓存键只含 pid、不含 H265/HDR，否则会继续发旧编码的流（issue #60）。
+/**
+ * 清空各模块的解析缓存。
+ *
+ * 名字保持不变：utils/systemConfigAPI.js:5 与 utils/configBackupAPI.js:17 都在
+ * import 它，改名要同步两处。画质/编码改动后必须调，否则三小时内继续下发旧
+ * 编码的流（issue #60）。
+ */
 function clearUrlCache() {
-  for (const k in urlCache) delete urlCache[k]
+  for (const module of listModules()) {
+    if (typeof module.clearResolveCache === 'function') module.clearResolveCache()
+  }
 }
 
-function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix) {
+// 把 HLS 清单里的相对路径改写为绝对地址（issue #98 清单直出用）。
+// 覆盖两类位置：URI 行（非 # 开头的行）与标签内的 URI="..." 属性（EXT-X-KEY/MEDIA/MAP 等）。
+// 纯字符串处理、无副作用，便于单测。
+function rewriteManifest(text, finalUrl) {
+  return text.split('\n').map(line => {
+    const t = line.trim()
+    if (!t) return line
+    if (t.startsWith('#')) {
+      return line.replace(/URI="([^"]*)"/g, (whole, uri) => {
+        try { return `URI="${new URL(uri, finalUrl).href}"` } catch { return whole }
+      })
+    }
+    try { return new URL(t, finalUrl).href } catch { return line }
+  }).join('\n')
+}
+
+// 取回一份 HLS 清单文本（跟随 302），非 200 或非 HLS 内容返回 null
+async function fetchHls(url, signal) {
+  const resp = await fetch(url, {
+    redirect: 'follow',
+    signal,
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+  })
+  if (!resp.ok) return null
+  const text = await resp.text()
+  if (!text.trimStart().startsWith('#EXTM3U')) return null
+  return { text, finalUrl: resp.url || url }
+}
+
+// master（多码率）清单里第一条子清单地址；不是 master 则返回 null。
+// 咪咕的 master 只有一条子清单，取第一条即全部。
+function firstVariantUrl(text, base) {
+  const lines = text.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].trim().startsWith('#EXT-X-STREAM-INF')) continue
+    for (let j = i + 1; j < lines.length; j++) {
+      const t = lines[j].trim()
+      if (!t || t.startsWith('#')) continue
+      try { return new URL(t, base).href } catch { return null }
+    }
+  }
+  return null
+}
+
+// 清单直出（issue #98）：极空间极影视等播放器不跟随 302 跳转，播放一直转圈。
+// 此模式由服务端替播放器取回 HLS 清单，相对路径改写成绝对地址后直接 200 返回。
+//
+// 咪咕返回的是 master（多码率）清单，里面还嵌着一层子清单地址——对严格按 HLS 规范
+// 实现的播放器没问题，但兼容模式面向的正是「实现不完整」的播放器：它们要么不跟随跳转，
+// 要么处理不了「清单里再跳一层、且跳到另一个主机」。故这里多走一跳，把 master 拍平成
+// 播放器直接能用的媒体清单（分片列表）——媒体清单是最基础的 HLS 形态，兼容面最广；
+// 咪咕 master 只有单条码率，拍平不损失任何画质选择。
+// 视频分片仍由播放器直连 CDN，服务器只经手清单文本，不占带宽。
+//
+// 注意：清单由服务端取回，节点由服务端网络选择，与「客户端就近取流」语义互斥——
+// 兼容模式面向 NAS 与播放设备同一网络的家庭场景，正好不需要就近取流。
+// 返回 null 表示取清单失败或内容不是 HLS，调用方应回退 302。
+async function fetchManifestDirect(playURL) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 10000)   // 覆盖两跳
+  try {
+    const master = await fetchHls(playURL, ctrl.signal)
+    if (!master) return null
+
+    const variantUrl = firstVariantUrl(master.text, master.finalUrl)
+    if (variantUrl) {
+      const media = await fetchHls(variantUrl, ctrl.signal)
+      // 拍平成功：直接给播放器分片列表；失败则退回改写后的 master（跟随能力正常的播放器仍可播）
+      if (media) return rewriteManifest(media.text, media.finalUrl)
+      printDebug(`子清单取回失败，退回 master 清单: ${variantUrl}`)
+    }
+    return rewriteManifest(master.text, master.finalUrl)
+  } catch (error) {
+    printDebug(`清单直出取回失败，回退 302: ${error.message}`)
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix, relay) {
 
   let result = {
     content: null,
@@ -121,8 +206,20 @@ function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix) 
   }
 
   // 咪咕 VIP 账号经 URL 注入（站长用 /<pass>/<userId>/<token>/m3u 的场景）；用户令牌请求已剥离成无账号段，不触发
-  if (urlUserId != userId && urlToken != token) {
+  // 「默认账号」现在来自咪咕模块的配置（原先是 config.js 的全局导出）
+  const miguAccount = getModuleConfig('migu')
+  if (urlUserId != (miguAccount.userId || "") && urlToken != (miguAccount.token || "")) {
     replaceHost = `${replaceHost}/${urlUserId}/${urlToken}`
+  }
+
+  // 兼容版订阅（?relay=1，issue #98）：频道地址改为 /relay/<pid> 清单直出路径，
+  // 供不跟随 302 跳转的播放器（极空间极影视、部分老电视盒）使用。
+  // 只匹配「${replace}/纯数字」的咪咕频道地址；x-tvg-url 的 playback.xml、外部源直链不受影响。
+  // 用路径前缀而非 query 参数：m3u 头的 catchup-source 以 "?" 开头直接拼在频道地址后，
+  // query 方案会拼出双问号破坏回看，路径方案天然兼容。
+  if (relay) {
+    // 带 .m3u8 后缀：极影视等播放器按 URL 后缀识别流格式，无后缀会被判定不可播（issue #98 追踪）
+    result.content = `${result.content}`.replace(/\$\{replace\}\/(\d+)/g, '${replace}/relay/$1.m3u8')
   }
 
   // 剥离内部属性 source-ids（issue #29/#68 源归属标记）后再输出给播放器：
@@ -132,6 +229,15 @@ function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix) 
   return result
 }
 
+/**
+ * 播放请求的解析外壳。
+ *
+ * 平台知识（签名、缓存、画质档位）已搬进 extractors/<id>/；这里只剩三件事：
+ * 解析地址里的 ref 与回看参数、按 ref 路由到模块、把模块结果拼成 HTTP 响应。
+ *
+ * 失败一律 code=200 + 中文正文（app.js:881-888 直接用 result.code 写响应头），
+ * 不改 4xx/5xx——那是存量播放器依赖的行为。
+ */
 async function channel(url, urlUserId, urlToken) {
 
   let result = {
@@ -156,68 +262,36 @@ async function channel(url, urlUserId, urlToken) {
     // printGrey("无参数传入")
   }
 
-  if (isNaN(pid)) {
+  // 按 ref 路由到模块。认不出来 = 收编前 isNaN(pid) 那条分支，措辞保持一致。
+  const module = resolverFor(pid)
+  if (!module) {
     result.desc = "地址格式错误"
     return result
   }
 
-  // printYellow("频道ID " + pid)
-
-  // 是否存在缓存
-  const cache = channelCache(pid, params)
-  if (cache.haveCache) {
-    result.code = cache.code
-    result.playURL = cache.playURL
-    result.desc = cache.cacheDesc
-    return result
-  }
-
-  let resObj = {}
+  let resolved
   try {
-    // 未登录请求720p
-    if (rateType >= 3 && (urlUserId == "" || urlToken == "")) {
-      resObj = await getAndroidURL720p(pid)
-    } else {
-      resObj = await getAndroidURL(urlUserId, urlToken, pid, rateType)
-    }
+    // ctx 带三样：账号（来自地址里的 /userId/token 段）、模块自己的生效配置
+    // （画质等，effectiveConfig 是纯内存计算，不碰磁盘）、以及回看参数由外壳处理。
+    const config = getExtractorManager().effectiveConfig(module)
+    resolved = await module.resolve(pid, { account: { userId: urlUserId, token: urlToken }, config })
   } catch (error) {
+    // 模块契约要求 resolve 不抛。万一抛了也绝不能让异常冒出去——app.js 的
+    // 请求 handler 没有顶层 try，未捕获异常等于请求永远不 end、客户端挂死。
     console.log(error)
     result.desc = "链接请求出错"
     return result
   }
-  printDebug(`添加加密字段后链接 ${resObj.url}`)
 
-  if (resObj.url != "") {
-    const location = await get302URL(resObj)
-    if (location != "") {
-      resObj.url = location
-    }
-  }
-  printLoginInfo(resObj)
-  // printRed(resObj.url)
-  // printGreen(`添加节目缓存 ${pid}`)
-  // 缓存有效时长
-  let addTime = 3 * 60 * 60 * 1000
-  // 节目调整
-  if (resObj.url == "") {
-    addTime = 1 * 60 * 1000
-  }
-  // 加入缓存
-  urlCache[pid] = {
-    // 有效期3小时 节目调整时改为1分钟
-    valTime: Date.now() + addTime,
-    url: resObj.url,
-    content: resObj.content,
-  }
-
-  if (resObj.url == "") {
-    let msg = resObj.content != null ? resObj.content.message : "节目调整，暂不提供服务"
-    result.desc = `${pid} ${msg}`
+  if (!resolved || resolved.url == "") {
+    result.desc = resolved?.desc || "服务异常"
     return result
   }
-  let playURL = resObj.url
 
-  // 添加回放参数
+  let playURL = resolved.url
+
+  // 添加回放参数。必须是裸字符串拼接——统一用 new URL()/URLSearchParams 构造
+  // 会把 puData / ddCalcu 里的原始字符重新编码，签名当场失效。
   if (params != "") {
     const resultParams = new URLSearchParams(params);
     for (const [key, value] of resultParams) {
@@ -225,53 +299,9 @@ async function channel(url, urlUserId, urlToken) {
     }
   }
 
-  // printGreen("链接获取成功")
   result.code = 302
   result.playURL = playURL
   return result
 }
 
-function channelCache(pid, params) {
-  let cache = {
-    haveCache: false,
-    code: 200,
-    pID: "",
-    playURL: "",
-    cacheDesc: ""
-  }
-  if (typeof urlCache[pid] === "object") {
-    const valTime = urlCache[pid].valTime - Date.now()
-    // 缓存是否有效
-    if (valTime >= 0) {
-      cache.haveCache = true
-      let playURL = urlCache[pid].url
-      let msg = "节目调整，暂不提供服务"
-      if (urlCache[pid].content != null) {
-        printLoginInfo(urlCache[pid])
-        msg = urlCache[pid].content.message
-      }
-      // 节目调整
-      if (playURL == "") {
-        cache.cacheDesc = `${pid} ${msg}`
-        return cache
-      }
-
-      // 添加回放参数
-      if (params != "") {
-        const resultParams = new URLSearchParams(params);
-        for (const [key, value] of resultParams) {
-          playURL = `${playURL}&${key}=${value}`
-        }
-      }
-      printGreen("使用缓存数据")
-      cache.code = 302
-      cache.cacheDesc = "缓存获取成功"
-      cache.playURL = playURL
-      return cache
-    }
-  }
-  cache.cacheDesc = "暂无缓存"
-  return cache
-}
-
-export { interfaceStr, channel, channelCache, clearUrlCache }
+export { interfaceStr, channel, clearUrlCache, fetchManifestDirect, rewriteManifest, firstVariantUrl }

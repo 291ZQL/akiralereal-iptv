@@ -40,17 +40,19 @@ function sanitizeSegment(value, fallback) {
 // ESM 命名导出是实时绑定，重新赋值后所有 import 方都会读到新值。
 // 注意：port、programInfoUpdateInterval 在 server.listen / setInterval 时已被读取，
 // 热更新不会改变已启动的监听端口与定时器周期，这两项仍需重启生效。
-let userId, token, port, host, rateType, debug, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, enableTvgNormalize, enableEpgAggregation, enableUserTokens, enableDisplayNameUnify
+let userId, token, port, host, rateType, debug, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, enableTvgNormalize, enableEpgAggregation, enableUserTokens, enableDisplayNameUnify, enableClientDispatch
 // 内容开关：咪咕核心 / 内置单频道源 / 内置订阅源。默认全开（老用户零感知）
-let enableMigu, enableBuiltInSources, enableBuiltInSubscriptions
+let enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors
 
 function applyConfig(systemConfig) {
   // 用户id
   userId = systemConfig.userId || process.env.muserId || ""
   // 用户token 可以使用网页登录获取
   token = systemConfig.token || process.env.mtoken || ""
-  // 本地运行端口号
-  port = systemConfig.port || process.env.mport || 1905
+  // 本地运行端口号：做区间校验兜底——配置文件可能被手改/由备份导入写入非法值，
+  // 非法端口会让 server.listen 启动即崩（999999）或静默绑到 unix socket（"abc"），必须回退默认
+  const rawPort = parseInt(systemConfig.port ?? process.env.mport)
+  port = (Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535) ? rawPort : 1905
   // 公网/自定义访问地址
   host = systemConfig.host || process.env.mhost || ""
   // 画质
@@ -86,6 +88,10 @@ function applyConfig(systemConfig) {
   // 统一频道显示名（issue #56）：按归一规则把异构源的频道显示名也统一到规范名（如 CCTV1/CCTV-1 → CCTV1综合）。
   // 默认关（opt-in，避免改动老用户的显示名）；手动重命名优先级更高。
   enableDisplayNameUnify = systemConfig.enableDisplayNameUnify !== undefined ? systemConfig.enableDisplayNameUnify : parseBool(process.env.menableDisplayNameUnify, false)
+  // 咪咕客户端就近取流（issue #82）：开启后播放时不在服务端解析 CDN 调度地址，直接把调度地址 302 给播放器，
+  // 由观看设备的网络就近分配节点。解决服务器与观看设备运营商不同（如服务器移动宽带、电视联通网）时的跨网卡顿。
+  // 默认关（opt-in）：多数部署服务器与设备同网，服务端解析可少一跳 302，且个别老盒子对多级跳转兼容性存疑。
+  enableClientDispatch = systemConfig.enableClientDispatch !== undefined ? systemConfig.enableClientDispatch : parseBool(process.env.menableClientDispatch, false)
 
   // 空白模式总开关：开启后下面三项内容开关「默认」翻转为关（一行得到空白 docker）。
   // 优先级：细粒度开关显式值 > 总开关推出的默认 > 全开。所以可 mblank=true + menableMigu=true 单独留咪咕。
@@ -97,6 +103,17 @@ function applyConfig(systemConfig) {
   enableBuiltInSources = systemConfig.enableBuiltInSources !== undefined ? systemConfig.enableBuiltInSources : parseBool(process.env.menableBuiltInSources, defOn)
   // 内置订阅源（精选频道）
   enableBuiltInSubscriptions = systemConfig.enableBuiltInSubscriptions !== undefined ? systemConfig.enableBuiltInSubscriptions : parseBool(process.env.menableBuiltInSubscriptions, defOn)
+  // ⚠️ 已退休的「抓取模块总开关」。现在**只**被 extractorManager 的一次性迁移读一次
+  //（把它的关闭态固化进各模块自己的开关，见 #migrateMasterSwitch），此后不再有任何
+  // 运行时效果 —— 每个模块的开关就是唯一真相。
+  //
+  // 为什么撤：它对全新安装零影响（非代理模块的默认值本来就是关），也管不到咪咕
+  //（走 enabledGetter），唯一的可观察效果是覆盖掉用户明确打开过的模块 —— 而界面上
+  // 它顶在模块卡片上方，任谁都以为它管全部。留着只会制造「我明明开了却不生效」。
+  //
+  // 保留读取而不是删掉：老部署的 system-config.json / menableExtractors 里可能有值，
+  // 迁移那一次要用它判断用户此前的意图。mblank 仍然管 README 里写的那三项内容开关。
+  enableExtractors = systemConfig.enableExtractors !== undefined ? systemConfig.enableExtractors : parseBool(process.env.menableExtractors, defOn)
 }
 
 applyConfig(loadSystemConfig())
@@ -104,7 +121,7 @@ applyConfig(loadSystemConfig())
 // 重新加载系统配置（保存系统配置后调用，避免必须重启进程）
 function reloadConfig() {
   applyConfig(loadSystemConfig())
-  return { userId, token, port, host, rateType, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, enableTvgNormalize, enableEpgAggregation, enableUserTokens, enableDisplayNameUnify, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions }
+  return { userId, token, port, host, rateType, pass, enableHDR, enableH265, programInfoUpdateInterval, refreshToken, adminPath, externalLogoBase, enableTvgNormalize, enableEpgAggregation, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors }
 }
 
-export { userId, token, port, host, rateType, debug, pass, enableHDR, programInfoUpdateInterval, enableH265, refreshToken, adminPath, externalLogoBase, enableTvgNormalize, enableEpgAggregation, enableUserTokens, enableDisplayNameUnify, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, reloadConfig, sanitizeSegment }
+export { userId, token, port, host, rateType, debug, pass, enableHDR, programInfoUpdateInterval, enableH265, refreshToken, adminPath, externalLogoBase, enableTvgNormalize, enableEpgAggregation, enableUserTokens, enableDisplayNameUnify, enableClientDispatch, enableMigu, enableBuiltInSources, enableBuiltInSubscriptions, enableExtractors, reloadConfig, sanitizeSegment }

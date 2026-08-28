@@ -6,8 +6,11 @@ import { adminPath, host, pass, port, programInfoUpdateInterval, token, userId, 
 import { getDateTimeStr } from "./utils/time.js";
 import update from "./utils/updateData.js";
 import { printBlue, printGreen, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
-import { channel, interfaceStr } from "./utils/appUtils.js";
+import { channel, interfaceStr, fetchManifestDirect } from "./utils/appUtils.js";
 import { dataPath } from "./utils/paths.js";
+import { getExtractorManager, getModuleConfig } from "./utils/extractorManager.js";
+import { getExtractorsAPI, startModuleLoginAPI, pollModuleLoginAPI, setExtractorEnabledAPI,
+  updateExtractorConfigAPI, runExtractorNowAPI, setContentFlagAPI } from "./utils/extractorsAPI.js";
 import { getChannelsAPI, getExternalSourcesAPI, saveExternalSourcesAPI,
          addExternalSourceAPI, removeExternalSourceAPI, updateExternalSourceAPI,
          setExternalSourceM3u8API, importSubscriptionAPI, parseLocalContentAPI,
@@ -19,10 +22,12 @@ import { getUsersAPI, addUserAPI, updateUserAPI, removeUserAPI, regenUserTokenAP
 import { getAliasesAPI, setAliasRuleAPI, removeAliasRuleAPI } from "./utils/aliasesAPI.js";
 import { getGroupRulesAPI, setGroupRuleAPI, removeGroupRuleAPI, moveGroupRuleAPI } from "./utils/groupRulesAPI.js";
 import { getSystemConfigAPI, saveSystemConfigAPI } from "./utils/systemConfigAPI.js";
+import { exportConfigAPI, importConfigAPI } from "./utils/configBackupAPI.js";
 import { readConfig, saveConfig, parseInterfaceTxt, validateGroupConfig, applyConfig,
          listProfiles, createProfile, renameProfile, deleteProfile } from "./utils/playlistConfig.js";
-import { updateBuiltInSources, updateExternalSources, externalSourceManager, builtInSourceManager } from "./utils/channelMerger.js";
+import { updateBuiltInSources, updateExternalSources, updateExtractors, externalSourceManager, builtInSourceManager } from "./utils/channelMerger.js";
 import { GITHUB_RAW_MIRRORS, isBuiltInSubscriptionSource } from "./utils/externalSources.js";
+import { startProbe, getProbeStatus, cancelProbe } from "./utils/sourceProbe.js";
 
 // 运行时长
 var hours = 0
@@ -48,7 +53,17 @@ function readBody(req) {
 // 升级过渡自愈只试一次（issue #29/#68）：见 /api/source-profiles POST
 let sourceIdsHealAttempted = false
 
-const server = http.createServer(async (req, res) => {
+/**
+ * 请求处理主体。
+ *
+ * 抽成具名函数、由 createServer 的回调兜住异常——原本整段没有顶层 try，
+ * 任何未捕获的异常（哪怕只是路径解析里的一个同步 throw）都不会产生响应：
+ * 请求永远不 res.end()，客户端一直挂到自己超时，服务端只在 unhandledRejection
+ * 留一行日志。挂死比报错难查得多。
+ *
+ * 各 /api/* 路由内部已各自有 try（共 24 处），这里是最外层的兜底。
+ */
+async function handleRequest(req, res) {
 
   // 获取请求方法、URL 和请求头
   let { method, url, headers } = req;
@@ -189,6 +204,30 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
+    // 配置导出/导入（issue #99）：单 JSON 打包，前端触发下载/上传
+    if (routePath === '/api/config-backup' && method === 'GET') {
+      printBlue("API: 导出配置")
+      const result = exportConfigAPI()
+      res.writeHead(result.success ? 200 : 500, { 'Content-Type': 'application/json;charset=UTF-8' });
+      res.end(JSON.stringify(result));
+      return
+    }
+
+    if (routePath === '/api/config-backup' && method === 'POST') {
+      try {
+        const body = await readBody(req)
+        const payload = JSON.parse(body)
+        const result = importConfigAPI(payload)
+        res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify(result));
+        printGreen(result.success ? "配置导入完成" : `配置导入失败: ${result.message}`)
+      } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error.message }));
+      }
+      return
+    }
+
     // 重启服务API
     if (routePath === '/api/restart' && method === 'POST') {
       printMagenta("API: 收到重启请求")
@@ -242,6 +281,29 @@ const server = http.createServer(async (req, res) => {
           result = await importSubscriptionAPI(data.index)
         } else if (data.action === 'parseLocalContent') {
           result = parseLocalContentAPI(data.contentBase64)
+        } else if (data.action === 'probeStart') {
+          // 失效检测（issue #88）：按源探测频道连通性。异步任务 + probeStatus 轮询，避免大订阅同步请求超时
+          // 优先按源稳定 id 定位：前端排序防抖窗口内 index 可能与服务端不一致，按 index 会测错源；旧调用回退 index
+          const srcList = externalSourceManager.sources?.sources || []
+          const src = data.id ? srcList.find(s => s && s.id === data.id) : srcList[data.index]
+          if (!src) {
+            result = { success: false, message: '源不存在' }
+          } else {
+            const channels = []
+            if (src.mode === 'subscription' && Array.isArray(src.parsedChannels)) {
+              for (const ch of src.parsedChannels) channels.push({ name: ch.name, url: ch.url, group: ch.group })
+            } else if (src.m3u8Url) {
+              // 直连/抓取模式：检测当前 m3u8 地址
+              channels.push({ name: src.name || '未命名源', url: src.m3u8Url, group: src.group })
+            }
+            result = channels.length === 0
+              ? { success: false, message: '该源没有可检测的频道（请先导入/保存）' }
+              : startProbe(srcList.indexOf(src), src.name || '未命名源', channels)
+          }
+        } else if (data.action === 'probeStatus') {
+          result = getProbeStatus()
+        } else if (data.action === 'probeCancel') {
+          result = cancelProbe()
         } else {
           result = { success: false, message: '未知操作' }
         }
@@ -377,11 +439,56 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
+    // 抓取模块（extractors/）：GET=整份状态，POST=按 action 分发
+    if (routePath === '/api/extractors' && method === 'GET') {
+      const result = getExtractorsAPI()
+      res.writeHead(result.success ? 200 : 500, { 'Content-Type': 'application/json;charset=UTF-8' });
+      res.end(JSON.stringify(result));
+      return
+    }
+
+    if (routePath === '/api/extractors' && method === 'POST') {
+      try {
+        const data = JSON.parse(await readBody(req))
+        let result
+        switch (data.action) {
+          case 'loginStart':
+            result = await startModuleLoginAPI(data.id)
+            break
+          case 'loginPoll':
+            result = await pollModuleLoginAPI(data.id, data.key)
+            break
+          case 'toggleModule':
+            result = setExtractorEnabledAPI(data.id, data.enabled !== false)
+            break
+          case 'saveConfig':
+            result = updateExtractorConfigAPI(data.id, data.config, data.refreshMinutes)
+            break
+          case 'refresh':
+            result = runExtractorNowAPI(data.id)
+            break
+          case 'contentFlag':
+            result = setContentFlagAPI(data.key, data.enabled !== false)
+            break
+          default:
+            result = { success: false, message: `未知操作: ${data.action}` }
+        }
+        res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        res.writeHead(500, { 'Content-Type': 'application/json;charset=UTF-8' });
+        res.end(JSON.stringify({ success: false, message: error.message }));
+      }
+      return
+    }
+
     // 源 ↔ 配置档 绑定（issue #29/#68）：GET=矩阵（源清单+档清单+每档禁用集），POST=切换某档某源的启用状态
     if (routePath === '/api/source-profiles' && method === 'GET') {
       try {
         const sources = []
-        if (enableMigu) sources.push({ id: 'migu', name: '咪咕源（核心）', type: 'migu' })
+        // 咪咕不在这里单列——它收编成抓取模块后由下方 listSourceIds() 以同一个
+        // id 'migu' 供给本清单，这里再 push 一条就是同 id 双行（界面出现两个
+        // 操作同一开关的复选框）。
         for (const s of (builtInSourceManager.getSourceList().sources || [])) {
           // 内置源 id 来自远程下发的 built-in-sources.json → 字符白名单消毒（防 HTML/EXTINF 属性注入）
           const safeId = s && s.id ? String(s.id).replace(/[^\w.-]/g, '') : ''
@@ -389,6 +496,12 @@ const server = http.createServer(async (req, res) => {
         }
         for (const s of (externalSourceManager.sources?.sources || [])) {
           if (s && s.id) sources.push({ id: `ext:${s.id}`, name: s.name || '未命名源', type: 'external', sourceEnabled: s.enabled !== false })
+        }
+        // 抓取模块的源一律列出：总开关已退休，每个模块的启用状态由它自己的开关决定，
+        // 而这份清单是「配置档 ↔ 源」的绑定用的，与模块此刻开没开无关
+        //（关掉的模块不出频道，但绑定关系要留着，开回来才不用重设）。
+        for (const s of getExtractorManager().listSourceIds()) {
+          sources.push({ id: s.id, name: s.name, type: 'extractor', sourceEnabled: true })
         }
         const profiles = listProfiles()
         const disabled = {}
@@ -410,8 +523,8 @@ const server = http.createServer(async (req, res) => {
         const data = JSON.parse(await readBody(req))
         const pid = (typeof data.profileId === 'string' && data.profileId) ? data.profileId : 'default'
         const sid = typeof data.sourceId === 'string' ? data.sourceId.trim() : ''
-        // 格式校验：只接受已知形态的源 id（migu / bi:<白名单字符> / ext:<白名单字符>），防任意字符串入配置落盘
-        if (!/^(migu|bi:[\w.-]{1,64}|ext:[\w.-]{1,64})$/.test(sid)) {
+        // 格式校验：只接受已知形态的源 id（migu / bi: 内置 / ext: 外部 / xt: 抓取模块），防任意字符串入配置落盘
+        if (!/^(migu|bi:[\w.-]{1,64}|ext:[\w.-]{1,64}|xt:[\w.-]{1,64})$/.test(sid)) {
           res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
           res.end(JSON.stringify({ success: false, message: 'sourceId 无效' }));
           return
@@ -701,6 +814,18 @@ const server = http.createServer(async (req, res) => {
     routeUrl += url.substring(queryIndex)
   }
 
+  // 清单直出兼容模式（issue #98）：/relay/<pid> 的 relay 段必须在下方「/userId/token」
+  // 两段解析之前剥掉，否则会被误当成账号注入前缀（relay 当 userId、pid 当 token）返回订阅内容。
+  // 支持前面带账号注入段的组合（/userId/token/relay/<pid>），剥掉 relay 段、其余原样保留。
+  let relayMode = false
+  // 可选 .m3u8 后缀：极影视等播放器按 URL 后缀识别流格式，无后缀会被判定不可播（issue #98 追踪）；
+  // 兼容版订阅输出 /relay/<pid>.m3u8，旧的无后缀形式继续支持
+  const relayMatch = routeUrl.match(/^(.*)\/relay\/(\d+)(?:\.m3u8)?((?:\?.*)?)$/)
+  if (relayMatch) {
+    relayMode = true
+    routeUrl = `${relayMatch[1]}/${relayMatch[2]}${relayMatch[3]}`
+  }
+
   let urlToken = ""
   let urlUserId = ""
   // 匹配是否存在用户信息 /userId/token/...
@@ -712,14 +837,20 @@ const server = http.createServer(async (req, res) => {
       routeUrl = urlSplit.length == 3 ? "/" : "/" + urlSplit[urlSplit.length - 1]
     }
   } else {
-    urlUserId = userId
-    urlToken = token
+    // 地址里没带账号段时，用咪咕模块配置里的账号兜底。
+    // `/userId/token/` 这个 URL 约定本身仍是咪咕特有的、留在路由层——搬的是
+    // 账号的存储位置，不是这条约定；把约定也模块化是更大的一次路由重构。
+    const migu = getModuleConfig('migu')
+    urlUserId = migu.userId || ""
+    urlToken = migu.token || ""
   }
 
   // 允许HEAD、OPTIONS预检请求
   if (method === "HEAD" || method === "OPTIONS") {
     res.writeHead(200, {
-      'Content-Type': 'application/json;charset=UTF-8',
+      // 清单直出地址按 HLS 类型应答 HEAD 探测：部分播放器播放前先 HEAD 判断类型，
+      // 回 application/json 会被判定「不可播放」（issue #98）
+      'Content-Type': relayMode ? 'application/vnd.apple.mpegurl' : 'application/json;charset=UTF-8',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, HEAD, OPTIONS',
       'Access-Control-Allow-Headers': '*'
@@ -748,7 +879,9 @@ const server = http.createServer(async (req, res) => {
   if (interfaceList.indexOf(routeUrlPath) !== -1) {
     // 用户绑定了档则用其绑定档（一人一内容），否则用 query 的 ?profile=
     const effectiveProfile = (currentUser && currentUser.profile) ? currentUser.profile : profileParam
-    const interfaceObj = interfaceStr(routeUrlPath, headers, urlUserId, urlToken, effectiveProfile, accessPrefix)
+    // 兼容版订阅（issue #98）：?relay=1 时频道地址输出为 /relay/<pid> 清单直出路径
+    const relayParam = /[?&]relay=1(?:&|$)/.test(routeUrl)
+    const interfaceObj = interfaceStr(routeUrlPath, headers, urlUserId, urlToken, effectiveProfile, accessPrefix, relayParam)
     if (interfaceObj.content == null) {
       interfaceObj.content = "获取失败"
     }
@@ -764,7 +897,8 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // 频道
+  // 频道（relayMode = 清单直出兼容模式，issue #98：极影视等播放器不跟随 302 跳转；
+  // relay 段已在「/userId/token」解析前剥离，此处 routeUrl 即普通频道地址）
   const result = await channel(routeUrl, urlUserId, urlToken)
 
   // 结果异常
@@ -778,12 +912,49 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  res.writeHead(result.code, {
+  if (relayMode) {
+    // 服务端取回清单、相对路径改写为绝对地址后直出，播放器无需跟随任何跳转
+    const manifest = await fetchManifestDirect(result.playURL)
+    if (manifest != null) {
+      const body = Buffer.from(manifest, 'utf-8')
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Access-Control-Allow-Origin': '*',
+        // 直播媒体清单会被播放器周期性轮询，必须禁缓存，否则拿到旧分片列表会卡住不前
+        'Cache-Control': 'no-cache, no-store',
+        // 显式 Content-Length（避免 chunked 传输）：部分简易播放器的 HTTP 客户端对分块传输支持不佳
+        'Content-Length': body.length,
+      });
+      res.end(body)
+      return
+    }
+    // 取清单失败（网络抖动/非 HLS 内容）：回退 302，能跟随跳转的播放器仍可播。
+    // 打一行日志：不跟随跳转的播放器此时会播不了，用户排查时能从日志看出走了回退
+    printYellow(`清单直出取回失败，回退 302（不跟随跳转的播放器将无法播放）: ${routeUrl.split('?')[0]}`)
+  }
+
+  res.writeHead(302, {
     'Content-Type': 'application/json;charset=UTF-8',
     location: result.playURL
   });
 
   res.end()
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(error => {
+    printRed(`请求处理异常 ${req.method} ${req.url}: ${error?.message || error}`)
+    // 已经开始写响应了就只能收口，再 writeHead 会抛 ERR_HTTP_HEADERS_SENT，
+    // 那样又变回「不 end」的挂死形态。
+    if (res.headersSent) {
+      try { res.end() } catch { /* 连接可能已断 */ }
+      return
+    }
+    try {
+      res.writeHead(500, { 'Content-Type': 'text/plain;charset=UTF-8' })
+      res.end('服务异常')
+    } catch { /* 连接可能已断 */ }
+  })
 })
 
 // 客户端发送畸形 HTTP 或在请求中途断开时，优雅丢弃连接而不是让进程崩溃
@@ -823,15 +994,25 @@ server.listen(port, async () => {
     printBlue(`当前已运行${hours}小时`)
   }, updateInterval * 60 * 60 * 1000);
 
-  // 定时任务2: 每 5 分钟检查外部源和内置源是否到刷新间隔（needsRefresh 按各源 refreshInterval 判定，不到点不抓）
+  // 定时任务2: 每 5 分钟检查外部源、内置源、抓取模块是否到刷新间隔（needsRefresh 按各自间隔判定，不到点不抓）
+  // 这一轮本身可能超过 5 分钟（外部源串行且每源之间硬睡 2 秒），必须自己防重入，
+  // 否则两轮会同时改同一批状态并写同一个文件，后写者覆盖前者。
+  let sourceTickRunning = false
   setInterval(async () => {
+    if (sourceTickRunning) {
+      printYellow("上一轮源刷新检查尚未结束，跳过本次")
+      return
+    }
+    sourceTickRunning = true
     try {
       const builtInResult = await updateBuiltInSources({ autoOnly: true })
       const externalResult = await updateExternalSources({ autoOnly: true })
+      const extractorResult = await updateExtractors({ autoOnly: true })
       // 若有任何源成功刷新了新 URL，立即重新生成播放列表（regenerateOnly 模式不重抓咪咕/节目单，速度快）
       const builtInUpdated = Array.isArray(builtInResult?.results) && builtInResult.results.some(r => r.success)
       const externalUpdated = Array.isArray(externalResult?.results) && externalResult.results.some(r => r.success)
-      if (builtInUpdated || externalUpdated) {
+      const extractorUpdated = Array.isArray(extractorResult?.results) && extractorResult.results.some(r => r.success)
+      if (builtInUpdated || externalUpdated || extractorUpdated) {
         printBlue("检测到源 URL 已更新，重新生成播放列表...")
         try {
           await update(hours, { regenerateOnly: true })
@@ -844,6 +1025,8 @@ server.listen(port, async () => {
     } catch (error) {
       console.log(error)
       printRed("源更新检查失败")
+    } finally {
+      sourceTickRunning = false
     }
   }, 5 * 60 * 1000); // 每 5 分钟检查一次：让各源的 refreshInterval 被准时执行（此前每小时才 check，间隔不精确）—— issue #73
 
@@ -892,7 +1075,10 @@ server.listen(port, async () => {
   }
   if (!enableMigu) {
     printYellow("咪咕源已禁用（enableMigu=false），当前为纯频道管理模式，仅分发内置/外部源")
-  } else if (userId === "" || token === "") {
-    printYellow("当前为游客模式（未配置咪咕账号），咪咕频道最高画质为 720p")
+  } else {
+    const migu = getModuleConfig('migu')
+    if (!migu.userId || !migu.token) {
+      printYellow("当前为游客模式（未配置咪咕账号），咪咕频道最高画质为 540p，填免费账号可到 720p")
+    }
   }
 })

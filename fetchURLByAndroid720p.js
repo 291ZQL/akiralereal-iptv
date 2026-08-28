@@ -1,5 +1,5 @@
 import { dataList, delay } from "./utils/fetchList.js"
-import { getAndroidURL720p } from "./utils/androidURL.js"
+import { getAndroidURL720p } from "./extractors/migu/androidURL.js"
 import { appendFile, appendFileSync, renameFileSync, writeFile } from "./utils/fileUtil.js"
 import { updatePlaybackData } from "./utils/playback.js"
 import { printBlue, printGreen, printRed, printYellow } from "./utils/colorOut.js"
@@ -9,7 +9,7 @@ async function fetchURLByAndroid720p() {
   const start = Date.now()
 
   // 获取数据
-  const datas = await dataList()
+  const { cates: datas } = await dataList()
 
   printGreen("数据获取成功！")
   // 必须绝对路径

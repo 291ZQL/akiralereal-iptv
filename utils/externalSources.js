@@ -5,6 +5,7 @@ import { dataPath } from "./paths.js"
 import { enableBuiltInSubscriptions } from "../config.js"
 import { printBlue, printGreen, printGrey, printRed, printYellow } from "./colorOut.js"
 import { extractM3u8FromWeb, validateM3u8 } from "./webSourceExtractor.js"
+import { collectOptsUntilUrl } from "./channelOpts.js"
 import fetch from 'node-fetch'
 
 /**
@@ -43,21 +44,17 @@ function parseM3uContent(content) {
     const logoMatch = line.match(/tvg-logo="([^"]*)"/)
     const name = extractExtinfName(line)
 
-    // 下一个非注释行是 URL
-    let url = ''
-    for (let j = i + 1; j < lines.length; j++) {
-      if (!lines[j].startsWith('#')) {
-        url = lines[j]
-        break
-      }
-    }
+    // 下一个非注释行是 URL；沿途的 #EXTVLCOPT 收进 opts（防盗链源靠它才播得动）
+    const { opts, urlIndex } = collectOptsUntilUrl(lines, i)
+    const url = urlIndex === -1 ? '' : lines[urlIndex]
 
     if (url && name) {
       channels.push({
         name,
         group: groupMatch ? groupMatch[1] : '未分组',
         logo: logoMatch ? logoMatch[1] : '',
-        url: url
+        url: url,
+        ...(opts.length ? { opts } : {})
       })
     }
   }
@@ -444,6 +441,50 @@ function inheritExistingSourceIds(incoming, current) {
   }
 }
 
+// 这份配置里有两个键是**服务端自己的账本**，前端完全不知道它们的存在：
+//
+//   · seededBuiltInUrls —— 「哪些内置订阅已经播种过」。它是「用户删掉的内置订阅
+//     不再复活」这个承诺（README「已添加的可在源管理删除，删后不再复活」）的
+//     唯一凭据。丢了 → 下次启动 ensureBuiltInSubscriptions 认为从没播种过 → 补回来。
+//   · retiredBuiltInsV1 —— 「退役迁移已跑过」的标记。而退役迁移是会**删源**的
+//     （见下方 retireBuiltInSubscriptions 里的 filter）。丢了 → 重跑 → 用户若手动
+//     重新添加过已退役的那两个订阅，会被再删一次。
+//
+// 而前端的 normalizeExternalConfig 只保留 { enabled, includeInPlaylists,
+// updateOnStartup, sources } 四个键，后台任何一次保存（编辑源 / 换序 / 导入订阅 /
+// 抓取并保存…）都把整份对象 POST 回来，saveSources 又是整份覆盖写盘 ——
+// 于是这两个账本每次保存都被静默抹掉。
+//
+// 实测：删掉「精选频道」→ 后台随便保存一次 → 重启，它就回来了。
+const SERVER_OWNED_KEYS = ['seededBuiltInUrls', 'retiredBuiltInsV1']
+
+/**
+ * 把内置订阅源**重新**播种回来（用户在「内置源」那一段主动打开开关时调用）。
+ *
+ * 与启动期的 ensureBuiltInSubscriptions 区别在于它**无视 seededBuiltInUrls**：
+ * 那个账本的意思是「别自己复活」，而这里是用户明确点了开关说「我要它」——
+ * 两回事。README 承诺的是删掉之后不会自己回来，不是永远回不来。
+ *
+ * 之所以必须有这个：内置订阅在「源管理」里已经不露面了，用户唯一的控制就是那个
+ * 开关。若开关对「曾经删过它的人」是哑的（点开也不回来），那就等于没有控制。
+ *
+ * @returns {boolean} 是否真的加了东西
+ */
+function reseedBuiltInSubscriptions(config) {
+  if (!config || !Array.isArray(config.sources)) return false
+  if (!Array.isArray(config.seededBuiltInUrls)) config.seededBuiltInUrls = []
+  let added = false
+  for (const builtIn of BUILT_IN_SUBSCRIPTIONS) {
+    const url = builtIn.subscriptionUrl
+    if (config.sources.some(s => s && s.subscriptionUrl === url)) continue  // 已经在了
+    config.sources.push(cloneBuiltInSubscription(builtIn))
+    if (!config.seededBuiltInUrls.includes(url)) config.seededBuiltInUrls.push(url)
+    printBlue(`重新加入内置订阅源: ${builtIn.name}`)
+    added = true
+  }
+  return added
+}
+
 // 一次性退役迁移：把已退役的内置订阅源从用户配置中移除（用 retiredBuiltInsV1 标记，只跑一次，
 // 之后尊重用户的手动增删，与 seededBuiltInUrls 的「只播种一次」哲学一致）。
 function retireBuiltInSubscriptions(config) {
@@ -547,7 +588,19 @@ class ExternalSourceManager {
     try {
       // 兜底：任何写盘路径（含前端整份保存的新建源）都保证每个源有稳定 id（issue #29/#68）
       // 先按「身份」继承现有 id（防前端未回读的旧副本让 id 漂移），再给真正的新源发号
-      if (sources !== this.sources) inheritExistingSourceIds(sources, this.sources)
+      if (sources !== this.sources) {
+        inheritExistingSourceIds(sources, this.sources)
+        // 调用方没带的服务端账本键，从当前配置里补回来（见 SERVER_OWNED_KEYS 的注释）。
+        // **不是**「合并所有缺失键」—— 只补这两个明确属于服务端的；其余字段仍以调用方
+        // 为准，因为用户改的就是它们，替调用方"补回"会让删除操作失效。
+        if (sources && typeof sources === 'object' && !Array.isArray(sources)) {
+          for (const key of SERVER_OWNED_KEYS) {
+            if (sources[key] === undefined && this.sources?.[key] !== undefined) {
+              sources[key] = this.sources[key]
+            }
+          }
+        }
+      }
       ensureSourceIds(sources)
       writeJsonFileSync(EXTERNAL_SOURCES_PATH, sources)
       this.sources = sources
@@ -556,6 +609,19 @@ class ExternalSourceManager {
       printRed(`保存外部源配置失败: ${error.message}`)
       return { success: false, message: error.message }
     }
+  }
+
+  /**
+   * 长耗时 await（网页抓取/订阅拉取）期间，前端整份保存（源排序/编辑）会用新数组替换 this.sources，
+   * 进入时快照的 index 与对象引用都随之失效——直接按快照回写会把结果写进错误的源并落盘。
+   * 回写前用本方法按稳定 id 在当前配置树里重新定位目标源；源已被删除时返回 null，
+   * 调用方应放弃写入（丢一次抓取结果比写错源安全）。
+   */
+  relocateSource(source) {
+    if (!source) return null
+    const cur = source.id ? this.sources.sources.find(s => s && s.id === source.id) : null
+    if (cur) return cur
+    return this.sources.sources.includes(source) ? source : null
   }
 
   /**
@@ -638,8 +704,10 @@ class ExternalSourceManager {
         for (const candidate of candidates) {
           const isValid = await validateM3u8(candidate, { referer: source.webUrl })
           if (isValid) {
-            this.sources.sources[index].m3u8Url = candidate
-            this.sources.sources[index].lastUpdated = new Date().toISOString()
+            const cur = this.relocateSource(source)
+            if (!cur) return { success: false, message: '源已被删除，放弃写入抓取结果' }
+            cur.m3u8Url = candidate
+            cur.lastUpdated = new Date().toISOString()
             this.saveSources()
             printGreen(`${source.name} 更新成功: ${candidate}`)
             return { success: true, m3u8Url: candidate }
@@ -647,8 +715,10 @@ class ExternalSourceManager {
         }
         // 校验失败时选择最有可能正确的链接（优先选择链接最长的，通常包含完整参数）
         const fallback = candidates.sort((a, b) => b.length - a.length)[0]
-        this.sources.sources[index].m3u8Url = fallback
-        this.sources.sources[index].lastUpdated = new Date().toISOString()
+        const cur = this.relocateSource(source)
+        if (!cur) return { success: false, message: '源已被删除，放弃写入抓取结果' }
+        cur.m3u8Url = fallback
+        cur.lastUpdated = new Date().toISOString()
         this.saveSources()
         printYellow(`${source.name} m3u8校验失败，已保存最长链接（共${candidates.length}个候选）`)
         printGrey(`  选中: ${fallback.substring(0, 100)}...`)
@@ -689,38 +759,42 @@ class ExternalSourceManager {
     try {
       printBlue(`更新订阅源: ${source.name} (${source.subscriptionUrl})`)
       const channels = await fetchAndParseM3u(source.subscriptionUrl)
-      
-      this.sources.sources[index].parsedChannels = channels
-      this.sources.sources[index].lastUpdated = new Date().toISOString()
-      this.sources.sources[index]._failCount = 0
+
+      const cur = this.relocateSource(source)
+      if (!cur) return { success: false, message: '源已被删除，放弃写入订阅结果' }
+      cur.parsedChannels = channels
+      cur.lastUpdated = new Date().toISOString()
+      cur._failCount = 0
       this.saveSources()
-      
+
       printGreen(`${source.name} 订阅更新成功，共 ${channels.length} 个频道`)
       return { success: true, channelCount: channels.length }
     } catch (error) {
       printRed(`${source.name} 订阅更新失败: ${error.message}`)
-      
+
+      // 回写前按 id 重新定位（await 期间快照 index 可能已失效）；源已被删则不写
+      const cur = this.relocateSource(source)
       // 如果已有缓存的频道数据，保留旧数据并设置短延迟避免每小时重试
-      const hasCache = Array.isArray(source.parsedChannels) && source.parsedChannels.length > 0
+      const hasCache = cur && Array.isArray(cur.parsedChannels) && cur.parsedChannels.length > 0
       if (hasCache) {
-        printYellow(`${source.name} 保留上次缓存的 ${source.parsedChannels.length} 个频道`)
+        printYellow(`${source.name} 保留上次缓存的 ${cur.parsedChannels.length} 个频道`)
         // 设置 lastUpdated 为当前时间减去 refreshInterval 的一半，避免立即重试
-        const halfInterval = ((source.refreshInterval || 1440) / 2) * 60 * 1000
-        this.sources.sources[index].lastUpdated = new Date(Date.now() - halfInterval).toISOString()
+        const halfInterval = ((cur.refreshInterval || 1440) / 2) * 60 * 1000
+        cur.lastUpdated = new Date(Date.now() - halfInterval).toISOString()
         this.saveSources()
-      } else {
+      } else if (cur) {
         // 没有缓存：递增失败计数，用于退避重试
-        const failCount = (source._failCount || 0) + 1
-        this.sources.sources[index]._failCount = failCount
+        const failCount = (cur._failCount || 0) + 1
+        cur._failCount = failCount
         // 失败超过3次后，设置短 lastUpdated 避免每小时都发起请求
         if (failCount > 3) {
           const backoffMinutes = Math.min(failCount * 30, 360) // 最长6小时退避
-          this.sources.sources[index].lastUpdated = new Date(Date.now() - ((source.refreshInterval || 1440) - backoffMinutes) * 60 * 1000).toISOString()
+          cur.lastUpdated = new Date(Date.now() - ((cur.refreshInterval || 1440) - backoffMinutes) * 60 * 1000).toISOString()
           this.saveSources()
           printYellow(`${source.name} 已连续失败 ${failCount} 次，${backoffMinutes} 分钟后重试`)
         }
       }
-      
+
       return { success: false, message: error.message }
     }
   }
@@ -761,9 +835,12 @@ class ExternalSourceManager {
     let skipped = 0
     let hasWork = false
     
-    for (let i = 0; i < this.sources.sources.length; i++) {
-      const source = this.sources.sources[i]
-      
+    // 快照当前源列表再遍历：循环里有多次 await，期间前端整份保存可能换序/增删源，
+    // 按活动数组的下标遍历会更新到错误的源。每轮更新前按 id 重新定位当前下标，源已被删则跳过。
+    const snapshot = [...this.sources.sources]
+    for (let i = 0; i < snapshot.length; i++) {
+      const source = snapshot[i]
+
       // 跳过禁用的源
       if (!source.enabled) {
         skipped++
@@ -797,15 +874,21 @@ class ExternalSourceManager {
         hasWork = true
       }
       
-      const result = await this.updateSource(i)
+      // 按 id 解析源的当前下标（await 间隔里可能被换序/删除）
+      const curIndex = this.sources.sources.findIndex(s => s === source || (source.id && s && s.id === source.id))
+      if (curIndex === -1) {
+        skipped++
+        continue
+      }
+      const result = await this.updateSource(curIndex)
       results.push({
-        index: i,
+        index: curIndex,
         name: source.name,
         ...result
       })
-      
+
       // 避免请求过快，添加延迟
-      if (i < this.sources.sources.length - 1) {
+      if (i < snapshot.length - 1) {
         await new Promise(resolve => setTimeout(resolve, 2000))
       }
     }
@@ -855,7 +938,8 @@ class ExternalSourceManager {
             url: ch.url,
             logo: ch.logo || "",
             groupTitle: group,
-            sourceId: source.id ? `ext:${source.id}` : undefined   // 源归属（issue #29/#68）
+            sourceId: source.id ? `ext:${source.id}` : undefined,  // 源归属（issue #29/#68）
+            ...(ch.opts && ch.opts.length ? { opts: ch.opts } : {})
           })
         })
         return
@@ -931,4 +1015,4 @@ class ExternalSourceManager {
 const externalSourceManager = new ExternalSourceManager()
 
 export default externalSourceManager
-export { ExternalSourceManager, fetchAndParseM3u, parsePlaylistContent, decodeAndParseLocalContent, splitCredentials, isBuiltInSubscriptionSource, GITHUB_RAW_MIRRORS, BUILT_IN_SUBSCRIPTIONS, ensureSourceIds, inheritExistingSourceIds }
+export { ExternalSourceManager, reseedBuiltInSubscriptions, fetchAndParseM3u, parsePlaylistContent, decodeAndParseLocalContent, splitCredentials, isBuiltInSubscriptionSource, GITHUB_RAW_MIRRORS, BUILT_IN_SUBSCRIPTIONS, ensureSourceIds, inheritExistingSourceIds }
