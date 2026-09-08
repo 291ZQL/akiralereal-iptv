@@ -4,13 +4,13 @@
  * 平台知识全在 extractors/<id>/，这里只负责「什么时候调 fetch、结果放哪、
  * 失败了怎么办、后台看到什么」。
  *
- * 三层开关，任一层关掉都是「不联网、不出现在播放列表、磁盘数据原样保留、
- * 开回来即恢复」（与 EPG 聚合的三级开关同语义）：
+ * 模块开关关掉后都是「不联网、不出现在播放列表、磁盘数据原样保留、
+ * 开回来即恢复」：
  *   单模块 enabled（extractors.json）—— 就是唯一真相。
  *   代理开关的模块（咪咕→config.js:enableMigu）走自己的 getter。
  *   历史上还有「部署级 enableExtractors」和「文件级 enabled」两层，都已撤：
- *   前者对全新安装零影响、只会覆盖用户明确打开过的模块（见 #migrateMasterSwitch），
- *   后者与前者同名同义、纯属困惑源。
+ *   前者的显式关闭态只在升级时迁移一次（见 #migrateMasterSwitch），后者与前者
+ *   同名同义、纯属困惑源。
  *
  * 两份文件，刻意分开：
  *   extractors.json        用户配置。小、少变、进配置备份白名单。
@@ -59,6 +59,41 @@ function emptyHealth() {
     skippedCount: 0,
     warnings: [],
   }
+}
+
+/**
+ * 延迟解析模块升级后，磁盘缓存里可能还留着新版已经不再认领的 deferredRef。
+ * 若原样输出，已迁入 IPTV.m3u 的固定源会和旧模块缓存同时出现，甚至继续生成
+ * 永远无法解析的本地代理地址。每次加载缓存都按模块当前 claimsRef 收口；没有
+ * deferredRef 的普通缓存频道不受影响。
+ */
+export function pruneUnclaimedCachedChannels(module, groups) {
+  const sourceGroups = Array.isArray(groups) ? groups : []
+  if (module?.capabilities?.resolve !== true || typeof module.claimsRef !== 'function') {
+    return { groups: sourceGroups, removed: 0 }
+  }
+
+  let removed = 0
+  const current = []
+  for (const group of sourceGroups) {
+    const channels = []
+    for (const channel of (Array.isArray(group?.dataList) ? group.dataList : [])) {
+      if (channel?.deferredRef == null) {
+        channels.push(channel)
+        continue
+      }
+      let claimed = false
+      try {
+        claimed = module.claimsRef(String(channel.deferredRef)) === true
+      } catch {
+        claimed = false
+      }
+      if (claimed) channels.push(channel)
+      else removed++
+    }
+    if (channels.length > 0) current.push({ ...group, dataList: channels })
+  }
+  return { groups: current, removed }
 }
 
 function isPlainObject(value) {
@@ -123,6 +158,26 @@ export function validateConfig(module, input, stored = {}) {
         continue
       }
       config[key] = coerceSelect(field, text)
+      continue
+    }
+
+    if (field.type === 'multiselect') {
+      const allowed = (field.options || []).map(o => String(o.value))
+      const submitted = (Array.isArray(raw) ? raw : String(raw ?? '').split(/\r?\n/))
+        .map(value => String(value).trim())
+        .filter(Boolean)
+      const values = [...new Set(submitted)]
+      const keepOrDrop = () => { if (kept !== undefined) config[key] = kept }
+      if (!values.length) {
+        errors.push({ key, message: `${field.label}：至少选择一项` })
+        keepOrDrop(); continue
+      }
+      if (values.some(value => !allowed.includes(value))) {
+        errors.push({ key, message: `${field.label}：包含无效选项` })
+        keepOrDrop(); continue
+      }
+      // 仍按换行字符串落盘，旧版 parseAreaNames 与已有配置无需迁移。
+      config[key] = values.join('\n')
       continue
     }
 
@@ -281,10 +336,33 @@ class ExtractorManager {
     if (!isPlainObject(this.cache.modules)) this.cache.modules = {}
     // 磁盘上的配置可能整份换过（备份导入走 reload→load）：把所有模块的配置代数
     // +1，作废还在飞的抓取轮——它们跑的是换盘前的配置（见 #runOne）。
+    let cacheChanged = false
     for (const module of listModules()) {
       this.configGen.set(module.id, (this.configGen.get(module.id) || 0) + 1)
+      const cacheEntry = this.#cacheEntry(module.id)
+      const pruned = pruneUnclaimedCachedChannels(module, cacheEntry.groups)
+      if (pruned.removed > 0) {
+        cacheEntry.groups = pruned.groups
+        cacheEntry.health.channelCount = pruned.groups.reduce(
+          (sum, group) => sum + group.dataList.length, 0)
+        cacheChanged = true
+        printYellow(`抓取模块 ${module.name} 已清理 ${pruned.removed} 个新版不再认领的缓存频道`)
+      }
+      // 代码内置频道表升级时，旧磁盘缓存即使未到刷新周期也要立刻重建。
+      // 旧 groups 先保留作失败兜底；ensureWarm 会按版本不匹配主动抓取，只有
+      // 成功后 #recordSuccess 才盖上新版本。
+      if (module.catalogVersion != null
+        && cacheEntry.groups.length > 0
+        && cacheEntry.catalogVersion !== module.catalogVersion) {
+        cacheEntry.health.lastSuccessAt = null
+        cacheEntry.health.nextRetryAt = null
+        cacheEntry.health.consecutiveFailures = 0
+        cacheChanged = true
+        printYellow(`抓取模块 ${module.name} 的频道表已升级，启动时重新生成`)
+      }
     }
     this.loaded = true
+    if (cacheChanged) this.#saveCache()
     // 放在 load() 而不是启动流程里：配置导入会调 reload()，用户导入一份「搬家之前
     // 导出的备份」时，包里 extractors.json 没有这些字段、system-config.json 有，
     // 那时也必须搬一次，否则导入完就是当场降档。
@@ -296,11 +374,9 @@ class ExtractorManager {
   /**
    * 一次性迁移：把「抓取模块总开关」的关闭态折进各模块自己的开关，之后总开关退休。
    *
-   * 背景：原先 isModuleEnabled 里有一道 `if (!enableExtractors) return false`。实测
-   * 它对**全新安装零影响** —— 非代理模块的默认值本来就是关（见 #entry）。它唯一的
-   * 可观察效果是：覆盖掉用户已经明确打开的模块。也就是说这个开关存在的意义仅仅是
-   * 静默否定用户的选择，而界面上它顶在模块卡片上方，任谁都以为它管全部（咪咕其实
-   * 也不受它管，因为走 enabledGetter）。所以撤掉它，让每个模块的开关都真实有效。
+   * 背景：原先 isModuleEnabled 里还有一道 `if (!enableExtractors) return false`，会
+   * 静默覆盖用户已经明确设置的模块开关；界面上它又管不到走 enabledGetter 的咪咕。
+   * 所以撤掉它，让每个模块的开关都真实有效。
    *
    * 但撤掉之前必须照顾一种人：设了 mblank=true / menableExtractors=false，同时又在
    * 后台点开过某个模块（当时点了不生效）。直接撤会让那个模块在升级后突然打开，
@@ -435,7 +511,12 @@ class ExtractorManager {
       const module = getModule(id)
       const memoryOnly = module?.capabilities?.cache === 'memory'
       persisted.modules[id] = memoryOnly
-        ? { groups: [], health: entry.health, memoryOnly: true }
+        ? {
+            groups: [],
+            health: entry.health,
+            memoryOnly: true,
+            ...(entry.catalogVersion != null ? { catalogVersion: entry.catalogVersion } : {}),
+          }
         : entry
     }
     writeJsonFileSync(this.cachePath, persisted)
@@ -458,9 +539,8 @@ class ExtractorManager {
       // 一起管掉的话，这个既有组合就废了，是对存量用户的破坏性变更。
       return !!module.enabledGetter()
     }
-    // 这里原先还有一道 `if (!enableExtractors) return false`。已撤——它对全新安装
-    // 零影响（模块默认就是关），唯一效果是覆盖用户明确打开过的模块。详见
-    // #migrateMasterSwitch 的注释。
+    // 这里原先还有一道 `if (!enableExtractors) return false`。已撤——旧关闭态只在
+    // 升级时一次性折进各模块，运行期每张卡片的开关就是唯一真相。详见迁移注释。
     return this.#entry(module.id).enabled
   }
 
@@ -485,7 +565,8 @@ class ExtractorManager {
     // 以为模块被禁用了。
     const proxied = typeof getModule(id)?.enabledGetter === 'function'
     if (proxied) delete entry.enabled
-    else if (typeof entry.enabled !== 'boolean') entry.enabled = false
+    // 新模块和从未保存过开关的存量模块默认启用；用户已经明确保存的 false 原样保留。
+    else if (typeof entry.enabled !== 'boolean') entry.enabled = true
     if (!isPlainObject(entry.config)) entry.config = {}
     normalizeLegacyConfig(getModule(id), entry.config)
     return entry
@@ -505,9 +586,15 @@ class ExtractorManager {
   }
 
   refreshMinutesOf(module) {
+    // 某些延迟解析模块自己维护短效签名、CDN 健康和失败重试。外层抓取周期
+    // 允许用户覆盖不仅无助于续签，还会制造过密请求或陈旧频道表，因此这类
+    // 模块始终使用作者声明的固定周期（也让升级前存过的旧覆盖值自然失效）。
+    if (module.refreshConfigurable === false) return module.defaultRefreshMinutes || 60
     const entry = this.#entry(module.id)
     const value = parseInt(entry.refreshMinutes, 10)
-    if (Number.isNaN(value) || value < 1) return module.defaultRefreshMinutes || 60
+    const min = module.minRefreshMinutes ?? 1
+    const max = module.maxRefreshMinutes ?? 1440
+    if (Number.isNaN(value) || value < min || value > max) return module.defaultRefreshMinutes || 60
     return value
   }
 
@@ -517,6 +604,16 @@ class ExtractorManager {
     const modules = listModules().map(module => {
       const entry = this.#entry(module.id)
       const cacheEntry = this.#cacheEntry(module.id)
+      const cachedChannelCount = cacheEntry.groups.reduce(
+        (sum, group) => sum + (group?.dataList?.length || 0), 0)
+      const health = {
+        ...emptyHealth(),
+        ...cacheEntry.health,
+        // 失败状态下的 channelCount 描述的是仍在输出的上次成功缓存，不是本轮结果。
+        // 显式告诉前端，避免卡片出现「失败 · 16 频道」却不解释链接为何还在。
+        usingCachedChannels: ['failed', 'risk'].includes(cacheEntry.health.status)
+          && cachedChannelCount > 0,
+      }
       const effective = this.effectiveConfig(module)
       const enabled = this.isModuleEnabled(module)
       const { config, secretsSet } = redactConfig(module, effective)
@@ -533,6 +630,8 @@ class ExtractorManager {
         id: module.id,
         name: module.name,
         description: module.description || '',
+        // 源管理据此分区；老模块不声明时归入免账号的普通模块。
+        category: module.category || 'standard',
         // 后台据此在卡片里多渲染一块辅助 UI（具体 markup 在 admin.html）
         helper: module.helper || '',
         // 助手挂在哪一段（不声明就渲染在表单最上面，咪咕就是这样）
@@ -548,14 +647,17 @@ class ExtractorManager {
         envProvided,
         refreshMinutes: this.refreshMinutesOf(module),
         defaultRefreshMinutes: module.defaultRefreshMinutes || 60,
-        health: cacheEntry.health,
+        minRefreshMinutes: module.minRefreshMinutes ?? 1,
+        maxRefreshMinutes: module.maxRefreshMinutes ?? 1440,
+        refreshConfigurable: module.refreshConfigurable !== false,
+        refreshDescription: module.refreshDescription || '',
+        health,
       }
     })
     return {
       // 不再有「抓取模块总开关」这一层：每个模块的开关就是唯一真相。
-      // 历史上这里回传过 enableExtractors，前端据此画一个顶在卡片上方的总开关——
-      // 而它管不到咪咕（走 enabledGetter），也管不到全新安装（模块默认就是关），
-      // 只会覆盖用户明确打开过的模块。见 #migrateMasterSwitch。
+      // 历史上这里回传过 enableExtractors，前端据此画一个顶在卡片上方的总开关；
+      // 它管不到走 enabledGetter 的咪咕，还会覆盖卡片自身的明确选择。见迁移注释。
       corrupt: this.corrupt,
       modules,
     }
@@ -600,9 +702,14 @@ class ExtractorManager {
     // 一直在用，重启后又无声回滚，手填的凭据就这样丢了。
     let refreshValue
     if (refreshMinutes !== undefined) {
+      if (module.refreshConfigurable === false) {
+        throw new Error(`${module.name} 的刷新策略由模块自动管理，无需手动设置`)
+      }
       refreshValue = parseInt(refreshMinutes, 10)
-      if (Number.isNaN(refreshValue) || refreshValue < 1 || refreshValue > 1440) {
-        throw new Error('刷新间隔要在 1~1440 分钟之间')
+      const min = module.minRefreshMinutes ?? 1
+      const max = module.maxRefreshMinutes ?? 1440
+      if (Number.isNaN(refreshValue) || refreshValue < min || refreshValue > max) {
+        throw new Error(`刷新间隔要在 ${min}~${max} 分钟之间`)
       }
     }
     const prevConfig = entry.config
@@ -650,9 +757,12 @@ class ExtractorManager {
    */
   #recordSuccess(id, groups, meta) {
     const entry = this.#cacheEntry(id)
+    const catalogVersion = getModule(id)?.catalogVersion
     const count = groups.reduce((sum, group) => sum + (group.dataList?.length || 0), 0)
     entry.groups = groups
     entry.fetchedAt = Date.now()
+    if (catalogVersion != null) entry.catalogVersion = catalogVersion
+    else delete entry.catalogVersion
     entry.health = {
       ...emptyHealth(),
       status: count > 0 ? 'ok' : 'empty',
@@ -692,14 +802,18 @@ class ExtractorManager {
    */
   async ensureWarm() {
     if (!this.loaded) this.load()
-    const cold = listModules().filter(module =>
-      this.isModuleEnabled(module)
-        && this.#cacheEntry(module.id).groups.length === 0
+    const cold = listModules().filter(module => {
+      const cacheEntry = this.#cacheEntry(module.id)
+      const catalogStale = module.catalogVersion != null
+        && cacheEntry.catalogVersion !== module.catalogVersion
+      return this.isModuleEnabled(module)
+        && (cacheEntry.groups.length === 0 || catalogStale)
         // 本进程没抓过才兜底。抓过之后即便结果是 0 条（比如 B 站房间全没开播），
         // 也不再反复重抓——那是合法的空，不是冷缓存。
-        && !this.attempted.has(module.id))
+        && !this.attempted.has(module.id)
+    })
     if (!cold.length) return { updated: false, results: [] }
-    printYellow(`抓取模块缓存未初始化，现抓一次：${cold.map(m => m.name).join('、')}`)
+    printYellow(`抓取模块缓存待预热，现抓一次：${cold.map(m => m.name).join('、')}`)
     const results = []
     for (const module of cold) results.push(await this.#runOne(module))
     this.#saveCache()
@@ -824,12 +938,28 @@ class ExtractorManager {
       // 会让那些设置一次性失配。
       const sourceId = module.sourceId || sourceIdOf(module.id)
       for (const group of this.#cacheEntry(module.id).groups) {
-        const name = group?.name || module.name
+        // 模块更名分组后，抓取失败会继续沿用旧磁盘缓存。输出时先做别名
+        // 迁移，避免用户必须等平台下一次成功才能看到新分组名。
+        const cachedName = group?.name || module.name
+        const preserveName = (module.preserveGroupSuffixes || [])
+          .some(suffix => cachedName.endsWith(suffix))
+        const name = preserveName
+          ? cachedName
+          : module.outputGroupName || cachedName
         if (!groupMap.has(name)) groupMap.set(name, { name, dataList: [] })
         for (const channel of group?.dataList || []) {
           if (!channel?.name) continue
+          // 平台级 HLS 模式在输出时覆盖频道缓存，既避免每条频道重复声明，
+          // 也让平台防盗链规则变化后能立即修正旧磁盘缓存，无需等待下一轮抓取。
+          const hlsMode = module.channelHlsMode
+          const hlsRouting = hlsMode === 'proxy'
+            ? { proxyHls: true, relayHls: false }
+            : hlsMode === 'relay'
+              ? { proxyHls: false, relayHls: true }
+              : {}
           groupMap.get(name).dataList.push({
             ...channel,
+            ...hlsRouting,
             groupTitle: name,
             opts: sanitizeOpts(channel.opts),
             sourceId,
@@ -897,7 +1027,7 @@ function normalizeLegacyConfig(module, config) {
   if (!module) return
   for (const field of module.configSchema || []) {
     const type = field.type || 'text'
-    if (type !== 'text' && type !== 'select') continue
+    if (type !== 'text' && type !== 'select' && type !== 'multiselect') continue
     if (config[field.key] === '') delete config[field.key]
   }
 }

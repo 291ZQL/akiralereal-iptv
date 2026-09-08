@@ -61,4 +61,4 @@ check('URL 原样保留：&timestamp 不被改写成 ×tamp', () => {
   assert.equal(ch.url, url)
 })
 
-console.log(`\n全部通过：${passed}/5 ✅`)
+console.log(`\n全部通过：${passed}/${passed} ✅`)

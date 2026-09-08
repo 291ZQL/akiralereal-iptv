@@ -47,9 +47,23 @@ function miguFetchFail(respData) {
   return { url: "", rateType: 0, content: { message, raw: respData } }
 }
 
+// playurl 各档位的文案，只用于日志。与 extractors/migu/index.js 的画质选项一致；
+// 咪咕回应里出现的档位以外的数字兜底按数字打印。
+const RATE_LABELS = { 1: '流畅', 2: '标清 540P', 3: '高清 720P', 4: '蓝光 1080P', 7: '原画', 9: '4K 臻享超高清' }
+function rateLabel(rt) { return RATE_LABELS[rt] || `档位 ${rt}` }
+
+// 把咪咕拒绝时的原话带进日志。此前拒绝一律打「该账号没有会员」，可用户明明有会员、
+// 只是档位不含所请求的画质 / 终端权益，被这句话带着去纠结账号本身（issue #117）。
+function serverHint(respData) {
+  const msg = respData?.message
+  return msg && msg !== 'SUCCESS' ? `（咪咕：${msg}）` : ''
+}
+
 async function getAndroidURL(userId, token, pid, rateType, opts = {}) {
   const useHDR = opts.enableHDR ?? enableHDR
   const useH265 = opts.enableH265 ?? enableH265
+  // 可注入的请求函数，只给回归测试用（scripts/test-migu-4k-fallback.mjs）
+  const doFetch = opts.fetchUrl ?? fetchUrl
 
   if (rateType <= 1) {
     return {
@@ -90,43 +104,45 @@ async function getAndroidURL(userId, token, pid, rateType, opts = {}) {
   }
   // 请求
   const baseURL = "https://play.miguvideo.com/playurl/v1/play/playurl"
-  let params = "?sign=" + result.sign + "&rateType=" + rateType
-    + "&contId=" + pid + "&timestamp=" + timestramp + "&salt=" + result.salt
-    + "&flvEnable=true&super4k=true" + (rateType == 9 ? "&ott=true" : "") + enableH265Str + enableHDRStr
-  printDebug(`请求链接: ${baseURL + params}`)
-  let respData = await fetchUrl(baseURL + params, {
-    headers: headers
-  })
-
-  printDebug(respData)
-
-  if (!respData) return miguFetchFail(respData)
-  if (respData.rid == 'TIPS_NEED_MEMBER') {
-    printYellow("该账号没有会员 正在降低画质")
-    let respRateType = parseInt(respData.body.urlInfo?.rateType) > 4 ? 4 : 3
-    params = "?sign=" + result.sign + "&rateType=" + respRateType
+  const requestPlayurl = async (rt, withOtt) => {
+    const params = "?sign=" + result.sign + "&rateType=" + rt
       + "&contId=" + pid + "&timestamp=" + timestramp + "&salt=" + result.salt
-      + "&flvEnable=true&super4k=true" + enableH265Str + enableHDRStr
+      + "&flvEnable=true&super4k=true" + (withOtt ? "&ott=true" : "") + enableH265Str + enableHDRStr
     printDebug(`请求链接: ${baseURL + params}`)
-    respData = await fetchUrl(baseURL + params, {
+    const resp = await doFetch(baseURL + params, {
       headers: headers
     })
-
-    if (!respData) return miguFetchFail(respData)
-    if (respData.rid == 'TIPS_NEED_MEMBER') {
-      printYellow("账号非钻石会员 降低画质")
-
-      params = "?sign=" + result.sign + "&rateType=3"
-        + "&contId=" + pid + "&timestamp=" + timestramp + "&salt=" + result.salt
-        + "&flvEnable=true&super4k=true" + enableH265Str + enableHDRStr
-      printDebug(`请求链接: ${baseURL + params}`)
-      respData = await fetchUrl(baseURL + params, {
-        headers: headers
-      })
-    }
+    printDebug(resp)
+    return resp
   }
 
-  printDebug(respData)
+  // 4K 先带 ott=true 请求。ott 是「大屏 / 电视终端」取流策略，咪咕按大屏（四屏）权益判定；
+  // 实测游客带 ott 直接 409 连降级流都不给，不带 ott 则正常给 540P、且 mediaFiles 里就列着
+  // rateType 9「臻享 超高清」——手机策略本身就有 4K。足球通这类不含电视端的「三屏」会员在
+  // 大屏策略下被判 TIPS_NEED_MEMBER，此前这里直接降到蓝光，1080P 就成了他们的天花板
+  // （issue #117）。现在被拒后先原样按手机策略再要一次 4K，仍被拒才降级；含大屏权益的
+  // 账号第一次就成功，路径不变。
+  let respData = await requestPlayurl(rateType, rateType == 9)
+  if (!respData) return miguFetchFail(respData)
+
+  if (respData.rid == 'TIPS_NEED_MEMBER' && rateType == 9) {
+    printYellow(`4K 按大屏策略被拒${serverHint(respData)}，改按手机策略再要一次 4K`)
+    respData = await requestPlayurl(9, false)
+    if (!respData) return miguFetchFail(respData)
+  }
+  if (respData.rid == 'TIPS_NEED_MEMBER') {
+    // 拒绝回应的 urlInfo.rateType 是咪咕愿意给的档位（同一字段在游客被拒时就是它降到的
+    // 540P）。它给到蓝光或更高就先要蓝光，否则直接高清；再被拒一次兜底到高清。
+    const offered = parseInt(respData.body?.urlInfo?.rateType)
+    const fallback = offered >= 4 ? 4 : 3
+    printYellow(`${rateLabel(rateType)} 超出账号权益${serverHint(respData)}，已降到 ${rateLabel(fallback)}`)
+    respData = await requestPlayurl(fallback, false)
+    if (!respData) return miguFetchFail(respData)
+    if (respData.rid == 'TIPS_NEED_MEMBER' && fallback != 3) {
+      printYellow(`${rateLabel(fallback)} 仍超出账号权益${serverHint(respData)}，已降到 ${rateLabel(3)}`)
+      respData = await requestPlayurl(3, false)
+    }
+  }
   // console.log(respData)
   if (!respData || !respData.body) return miguFetchFail(respData)
   const url = respData.body.urlInfo?.url
@@ -280,19 +296,31 @@ async function get302URL(resObj) {
   return ""
 }
 
-function printLoginInfo(resObj) {
-  // content 可能是 null——rateType <= 1 时 getAndroidURL 直接返回 {url:"", content:null}
-  // （见本文件 :49-55）。而调用点 utils/appUtils.js:293 在 try 之外，app.js 的
-  // 请求 handler 也没有顶层 try，于是这里一个 TypeError 就让请求永远不 end：
-  // 客户端挂死到超时，服务端只在 unhandledRejection 留一行日志。
-  if (resObj?.content?.body?.auth?.logined) {
-    printGreen("登录认证成功")
-    if (resObj.content.body.auth.authResult == "FAIL") {
-      printRed(`认证失败 视频内容不完整 可能缺少相关VIP: ${resObj.content.body.auth.resultDesc}`)
-    }
+/**
+ * 取流成功后打一行摘要：拿到的档位、是否游客、是否只给了试看。
+ *
+ * 此前这里打「登录认证成功」，鉴权字段为 FAIL 时再打一行红字「认证失败 视频内容不完整
+ * 可能缺少相关VIP」。可那行红字在流已经正常下发时也会打——账号没订购该内容的产品但内容
+ * 本身允许播放、或者咪咕只给了几分钟试看——看着像出了错，其实什么都没坏；真正要紧的
+ * 「拿到哪一档、试看多少秒」反而不打，issue #117 排查时全靠播放器截图。现在：完整播放绿字，
+ * 只给试看黄字，红字只留给拿不到地址的情况（由调用方按 desc 报）。
+ *
+ * content 可能是 null——rateType <= 1 时 getAndroidURL 直接返回 {url:"", content:null}；
+ * 调用点在 try 之外，这里抛 TypeError 会让请求永远不 end，所以一律可选链。
+ */
+function printStreamInfo(resObj, { cached = false } = {}) {
+  const body = resObj?.content?.body
+  if (!resObj?.url || !body) return
+  const info = body.urlInfo || {}
+  const rate = info.rateDesc || rateLabel(parseInt(info.rateType))
+  const who = body.auth?.logined ? '' : '游客 · '
+  const trySee = parseInt(info.trySeeDuration) || 0
+  const head = `咪咕取流${cached ? '（缓存）' : ''}：${who}${rate}`
+  if (trySee > 0) {
+    printYellow(`${head} · 仅试看 ${trySee} 秒（账号没有这条内容的观看权益）`)
   } else {
-    // printYellow("未登录")
+    printGreen(head)
   }
 }
 
-export { getAndroidURL, getAndroidURL720p, get302URL, printLoginInfo }
+export { getAndroidURL, getAndroidURL720p, get302URL, printStreamInfo }

@@ -1,16 +1,21 @@
 import http from "node:http"
-import { readFileSync, mkdirSync, existsSync } from "node:fs"
+import { localRequestHandlerFor, resolverFor, shutdownModules } from './extractors/registry.js'
+import { pipeFlv } from './utils/flvProxy.js'
+import { readFileSync, mkdirSync, existsSync, statSync } from "node:fs"
 import { createRequire } from "node:module"
 import fetch from 'node-fetch'
 import { adminPath, host, pass, port, programInfoUpdateInterval, token, userId, enableMigu, enableBuiltInSubscriptions, enableUserTokens } from "./config.js";
 import { getDateTimeStr } from "./utils/time.js";
 import update from "./utils/updateData.js";
-import { printBlue, printGreen, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
-import { channel, interfaceStr, fetchManifestDirect } from "./utils/appUtils.js";
+import { printBlue, printGreen, printGrey, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
+import { channel, interfaceStr, fetchManifestDirect, rewriteManifest, inlineResolvedManifest } from "./utils/appUtils.js";
+import { toProxyManifest, lookup as lookupProxyTarget, pipeUpstream, probeUpstream, fetchNested, manifestCooling, markManifestResult } from "./utils/hlsProxy.js";
 import { dataPath } from "./utils/paths.js";
 import { getExtractorManager, getModuleConfig } from "./utils/extractorManager.js";
 import { getExtractorsAPI, startModuleLoginAPI, pollModuleLoginAPI, setExtractorEnabledAPI,
-  updateExtractorConfigAPI, runExtractorNowAPI, setContentFlagAPI } from "./utils/extractorsAPI.js";
+  updateExtractorConfigAPI, runExtractorNowAPI, setContentFlagAPI, startBrowserLoginAPI,
+  getBrowserLoginStatusAPI, checkBrowserLoginAPI, cancelBrowserLoginAPI,
+  closeBrowserLoginAPI, importBrowserLoginAPI } from "./utils/extractorsAPI.js";
 import { getChannelsAPI, getExternalSourcesAPI, saveExternalSourcesAPI,
          addExternalSourceAPI, removeExternalSourceAPI, updateExternalSourceAPI,
          setExternalSourceM3u8API, importSubscriptionAPI, parseLocalContentAPI,
@@ -23,16 +28,128 @@ import { getAliasesAPI, setAliasRuleAPI, removeAliasRuleAPI } from "./utils/alia
 import { getGroupRulesAPI, setGroupRuleAPI, removeGroupRuleAPI, moveGroupRuleAPI } from "./utils/groupRulesAPI.js";
 import { getSystemConfigAPI, saveSystemConfigAPI } from "./utils/systemConfigAPI.js";
 import { exportConfigAPI, importConfigAPI } from "./utils/configBackupAPI.js";
-import { readConfig, saveConfig, parseInterfaceTxt, validateGroupConfig, applyConfig,
+import { readConfig, saveConfig, parseInterfaceTxt, collectGroupConflicts, applyConfig,
          listProfiles, createProfile, renameProfile, deleteProfile } from "./utils/playlistConfig.js";
 import { updateBuiltInSources, updateExternalSources, updateExtractors, externalSourceManager, builtInSourceManager } from "./utils/channelMerger.js";
 import { GITHUB_RAW_MIRRORS, isBuiltInSubscriptionSource } from "./utils/externalSources.js";
 import { startProbe, getProbeStatus, cancelProbe } from "./utils/sourceProbe.js";
+import { SYSTEM_ASSET_PATHS, readAnnouncementAsset } from "./utils/announcement.js";
+
+// 全代理/兼容模式（issue #98）的服务端可观测性。上一版的日志设计在实战里分不清三种情况
+// （首行不带分片数、每 pid 每分钟一行会让 curl 与播放器互吞对方的行、分片 404 与上游失败全静默），
+// 用户回报「还是播不了」时日志无法归属。这一版：
+//   - 每行都带来源 IP + UA，curl 与播放器一眼可分；
+//   - 限流键为「事件|pid|来源IP|UA|方法」，同一 IP 下 curl 与播放器也不会互吞；
+//   - 分片计数拆「请求次数 / 转发成功数」，取了清单却不取分片（0/0）与取了分片但上游失败（N/0）可分。
+const logWindows = new Map()   // 「事件|pid|IP|UA|方法」 -> 上次打行时间
+function logOncePer(key, ms) {
+  const now = Date.now()
+  if (now - (logWindows.get(key) || 0) < ms) return false
+  if (logWindows.size > 5000) logWindows.clear()   // 诊断辅助表，粗暴清空即可
+  logWindows.set(key, now)
+  return true
+}
+
+function clientOf(req) {
+  const ip = (req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '?').replace(/^::ffff:/, '')
+  const ua = String(req.headers['user-agent'] || '无UA').replace(/[\r\n]/g, ' ')
+  return { ip, key: `${ip}|${ua.slice(0, 120)}`, tag: `${ip} UA:${ua.slice(0, 80)}` }
+}
+
+/**
+ * 可见浏览器窗口会出现在“运行本服务的电脑”上，不是访问后台的远端设备上。
+ * 只有“弹出可见登录窗口”必须来自 loopback；查看/校验已有 profile、取消流程和
+ * 关闭后台会话仍可由正常后台远程管理。Host 也必须是 loopback，避免反代在无
+ * Origin 的请求里把远端连接伪装成本机 socket。
+ */
+function isLocalBrowserLoginRequest(req) {
+  const isLoopbackHost = value => ['localhost', '127.0.0.1', '::1', '[::1]']
+    .includes(String(value || '').toLowerCase())
+  const remote = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '')
+  if (remote !== '127.0.0.1' && remote !== '::1') return false
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim().replace(/^::ffff:/, '')
+  if (forwarded && forwarded !== '127.0.0.1' && forwarded !== '::1') return false
+  try {
+    if (!isLoopbackHost(new URL(`http://${String(req.headers.host || '')}`).hostname)) return false
+  } catch {
+    return false
+  }
+  const origin = String(req.headers.origin || '')
+  if (!origin) return true
+  try {
+    return isLoopbackHost(new URL(origin).hostname)
+  } catch {
+    return false
+  }
+}
+
+const proxyStats = new Map()   // pid|client -> { head, get, ok, since }  自该客户端上一条清单日志以来的计数
+
+function proxyStat(pid, req) {
+  const key = `${pid}|${clientOf(req).key}`
+  let stat = proxyStats.get(key)
+  if (!stat) {
+    if (proxyStats.size > 5000) proxyStats.clear()
+    stat = { head: 0, get: 0, ok: 0, since: 0 }
+    proxyStats.set(key, stat)
+  }
+  return stat
+}
+
+function noteProxySegment(pid, req) {
+  const stat = proxyStat(pid, req)
+  if (req.method === 'HEAD') stat.head++
+  else stat.get++
+  // 每客户端每分钟报一次「分片请求确实到达了」——这是「取了清单却零分片」与否的直接分界
+  const client = clientOf(req)
+  if (logOncePer(`seg|${pid}|${client.key}|${req.method}`, 60 * 1000)) {
+    const range = req.headers.range ? ` Range:${req.headers.range}` : ''
+    printGrey(`全代理：${pid} ${req.method} 分片请求${range}｜${client.tag}`)
+  }
+}
+
+function logProxySegmentResult(pid, req, result, elapsedMs) {
+  const stat = proxyStat(pid, req)
+  if (result.ok) stat.ok++
+  const client = clientOf(req)
+  const key = `seg-result|${result.ok ? 'ok' : 'fail'}|${pid}|${client.key}|${req.method}`
+  if (logOncePer(key, result.ok ? 60 * 1000 : 10 * 1000)) {
+    // 无 error 却不完整 = 传输中途断开（多为客户端切台提前挂断）——标出来，
+    // 否则黄行里「-> 200」和「失败」并存会让读日志的人困惑
+    const detail = result.error ? ` error:${result.error}` : (result.complete ? '' : ' 未完整')
+    const line = `全代理：${pid} ${req.method} 分片 -> ${result.status}，${result.bytes} bytes，${elapsedMs}ms${detail}｜${client.tag}`
+    if (result.ok) printGrey(line); else printYellow(line)
+  }
+}
+
+function logProxyProbe(pid, req, result, elapsedMs) {
+  const client = clientOf(req)
+  const key = `probe|${result.ok ? 'ok' : 'fail'}|${pid}|${client.key}|${req.method}`
+  if (logOncePer(key, result.ok ? 60 * 1000 : 10 * 1000)) {
+    const length = result.contentLength ? ` Content-Length:${result.contentLength}` : ''
+    const ranges = result.acceptRanges ? ` Accept-Ranges:${result.acceptRanges}` : ''
+    const fallback = result.mode === 'fallback' ? ` 回退:${result.reason}` : ' 上游HEAD'
+    const line = `全代理：${pid} HEAD 分片 -> ${result.status}，${elapsedMs}ms${length}${ranges}${fallback}｜${client.tag}`
+    if (result.ok) printGrey(line); else printYellow(line)
+  }
+}
+
+function logProxyManifest(pid, req, contentLength) {
+  const client = clientOf(req)
+  if (!logOncePer(`manifest|${pid}|${client.key}|${req.method}`, 60 * 1000)) return
+  const stat = proxyStat(pid, req)
+  const now = Date.now()
+  const counts = stat.since
+    ? `近 ${Math.round((now - stat.since) / 1000)} 秒分片 HEAD ${stat.head} 次、GET ${stat.get} 次、成功 ${stat.ok} 次`
+    : '开始计数'
+  printGrey(`全代理：${pid} ${req.method} 清单 -> 200，Content-Length:${contentLength}（${counts}）｜${client.tag}`)
+  stat.head = 0; stat.get = 0; stat.ok = 0; stat.since = now
+}
 
 // 运行时长
 var hours = 0
 
-// 本地台标文件夹：用户把 <频道名>.png 放进数据目录的 logos/，优先于 fanmingming 兜底。
+// 本地台标文件夹：用户把 <频道名>.png 放进数据目录的 logos/，优先于公共台标库兜底。
 // 放 mdataDir 下随数据卷持久化；启动时建好，方便用户找到位置。
 const LOGOS_DIR = dataPath('logos')
 try { mkdirSync(LOGOS_DIR, { recursive: true }) } catch (e) { /* 已存在或无法创建，读写时再报 */ }
@@ -141,6 +258,15 @@ async function handleRequest(req, res) {
     return
   }
 
+  // Public, fixed player library asset; no user content or credentials.
+  if (urlPath === '/player-assets/mpegts.js') {
+    if (!['GET', 'HEAD'].includes(method)) { res.writeHead(405); res.end(); return }
+    const library = readFileSync(new URL('./web/vendor/mpegts.js', import.meta.url))
+    res.writeHead(200, { 'Content-Type': 'text/javascript;charset=UTF-8', 'Cache-Control': 'public, max-age=86400', 'X-Content-Type-Options': 'nosniff' })
+    res.end(method === 'HEAD' ? undefined : library)
+    return
+  }
+
   // 播放器页面路由（支持 /player 和 /密码/player）
   if (routePath === '/player') {
     if (!passAuthed) {
@@ -238,7 +364,7 @@ async function handleRequest(req, res) {
       // 依赖外部守护进程（Docker restart:always / pm2 / systemd）重新启动。
       setTimeout(() => {
         printMagenta("正在退出进程，等待守护进程（Docker/pm2/systemd）拉起...")
-        process.exit(0)
+        void shutdownProcess()
       }, 2000)
       return
     }
@@ -450,6 +576,15 @@ async function handleRequest(req, res) {
     if (routePath === '/api/extractors' && method === 'POST') {
       try {
         const data = JSON.parse(await readBody(req))
+        if (data.action === 'browserLoginStart' && !isLocalBrowserLoginRequest(req)) {
+          res.writeHead(403, { 'Content-Type': 'application/json;charset=UTF-8' })
+          res.end(JSON.stringify({
+            success: false,
+            code: 'LOCAL_BROWSER_LOGIN_ONLY',
+            message: '自动浏览器登录仅允许从服务所在电脑的 localhost 后台操作',
+          }))
+          return
+        }
         let result
         switch (data.action) {
           case 'loginStart':
@@ -457,6 +592,25 @@ async function handleRequest(req, res) {
             break
           case 'loginPoll':
             result = await pollModuleLoginAPI(data.id, data.key)
+            break
+          case 'browserLoginStart':
+            result = await startBrowserLoginAPI(data.id)
+            break
+          case 'browserLoginStatus':
+            result = await getBrowserLoginStatusAPI(data.id)
+            break
+          case 'browserLoginCheck':
+            result = await checkBrowserLoginAPI(data.id)
+            break
+          case 'browserLoginCancel':
+            result = await cancelBrowserLoginAPI(data.id)
+            break
+          case 'browserLoginClose':
+            result = await closeBrowserLoginAPI(data.id)
+            break
+          // 导入登录态不受「仅本机」限制：它就是给 Docker / NAS 这类远程后台用的
+          case 'browserLoginImport':
+            result = await importBrowserLoginAPI(data.id, data.payload)
             break
           case 'toggleModule':
             result = setExtractorEnabledAPI(data.id, data.enabled !== false)
@@ -712,10 +866,14 @@ async function handleRequest(req, res) {
 
         if (groupConfigChanged) {
           const groups = parseInterfaceTxt()
-          const validation = validateGroupConfig(groups, config)
-          if (!validation.valid) {
+          // 只拦「本次改动新引入」的重名：早先合法建下的自定义分组，可能因为源分组后来才出现 / 被恢复
+          // 而事后撞名。这种旧冲突若也拦，新增 / 改名 / 删除分组会被整个锁死（用户体感「分组只能建一个」），
+          // 报错还指着那个不相干的旧分组名，且没有任何自助解开的入口。旧冲突放行，由 applyConfig 合并同名分组。
+          const existingConflicts = new Set(collectGroupConflicts(groups, currentConfig).map(item => item.name))
+          const introduced = collectGroupConflicts(groups, config).filter(item => !existingConflicts.has(item.name))
+          if (introduced.length > 0) {
             res.writeHead(400, { 'Content-Type': 'application/json;charset=UTF-8' });
-            res.end(JSON.stringify({ success: false, message: validation.message }));
+            res.end(JSON.stringify({ success: false, message: introduced[0].message }));
             return
           }
         }
@@ -777,6 +935,64 @@ async function handleRequest(req, res) {
     return
   }
 
+  // 项目自有公告短片与台标。视频支持 Range/HEAD，兼容 AVPlayer/APTV 等会先探测、
+  // 再按字节分段读取 MP4 的播放器；路由放在鉴权之后，密码和用户令牌不会被绕过。
+  // 兼容历史的 /<咪咕userId>/<token>/m3u 地址：该入口会把两段账号前缀带进
+  // 播放列表里的本机 URL，所以这里也接受以资源路径结尾的形式。
+  const announcementAssetPath = SYSTEM_ASSET_PATHS
+    .find(assetPath => routePath === assetPath || routePath.endsWith(assetPath))
+  if (announcementAssetPath) {
+    if (method !== 'GET' && method !== 'HEAD') {
+      res.writeHead(405, { Allow: 'GET, HEAD' })
+      res.end()
+      return
+    }
+    const asset = readAnnouncementAsset(announcementAssetPath)
+    if (!asset) {
+      res.writeHead(404, { 'Content-Type': 'text/plain;charset=UTF-8' })
+      res.end('announcement asset not found')
+      return
+    }
+    const total = asset.content.length
+    const baseHeaders = {
+      'Content-Type': asset.contentType,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'public, max-age=86400',
+    }
+    const range = String(headers.range || '').match(/^bytes=(\d*)-(\d*)$/)
+    if (headers.range && !range) {
+      res.writeHead(416, { ...baseHeaders, 'Content-Range': `bytes */${total}` })
+      res.end()
+      return
+    }
+    let start = 0
+    let end = total - 1
+    if (range) {
+      if (!range[1] && range[2]) {
+        const suffix = Number(range[2])
+        start = Math.max(0, total - suffix)
+      } else {
+        start = Number(range[1] || 0)
+        if (range[2]) end = Number(range[2])
+      }
+      end = Math.min(end, total - 1)
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start > end || start >= total) {
+        res.writeHead(416, { ...baseHeaders, 'Content-Range': `bytes */${total}` })
+        res.end()
+        return
+      }
+    }
+    const body = asset.content.subarray(start, end + 1)
+    const status = range ? 206 : 200
+    res.writeHead(status, {
+      ...baseHeaders,
+      'Content-Length': body.length,
+      ...(range ? { 'Content-Range': `bytes ${start}-${end}/${total}` } : {}),
+    })
+    if (method === 'HEAD') res.end(); else res.end(body)
+    return
+  }
+
   // 本地台标：/logos/<文件名>（也兼容前面带 /userId/token 段的情况），从数据目录 logos/ 读取。
   // 必须放在下方「用户段解析」之前，否则 /logos/x.png 会被当成 /userId/token 拆掉。
   const logosIdx = routePath.indexOf('/logos/')
@@ -792,15 +1008,30 @@ async function handleRequest(req, res) {
       res.writeHead(400); res.end(); return
     }
     try {
-      const buf = readFileSync(dataPath(`logos/${logoName}`))
+      const file = dataPath(`logos/${logoName}`)
+      // 条件请求（issue #119）：订阅里的台标 URL 已带 ?v=<mtime>，换图即换 URL；这里再补
+      // ETag / Last-Modified，让不认 query 的客户端至少能用 If-None-Match 拿到 304 而不是旧图。
+      const stat = statSync(file)
+      const etag = `"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`
+      const lastModified = new Date(stat.mtimeMs).toUTCString()
+      const cacheHeaders = { 'Cache-Control': 'public, max-age=86400', ETag: etag, 'Last-Modified': lastModified }
+      const ifNoneMatch = String(headers['if-none-match'] || '')
+      const ifModifiedSince = Date.parse(headers['if-modified-since'] || '')
+      const notModified = ifNoneMatch
+        ? ifNoneMatch.split(',').some(tag => tag.trim() === etag)
+        : Number.isFinite(ifModifiedSince) && Math.floor(stat.mtimeMs / 1000) * 1000 <= ifModifiedSince
+      if (notModified) {
+        res.writeHead(304, cacheHeaders); res.end(); return
+      }
+      const buf = readFileSync(file)
       const ext = logoName.slice(logoName.lastIndexOf('.') + 1).toLowerCase()
       const mime = ext === 'png' ? 'image/png'
         : (ext === 'jpg' || ext === 'jpeg') ? 'image/jpeg'
         : ext === 'webp' ? 'image/webp'
         : ext === 'svg' ? 'image/svg+xml'
         : 'application/octet-stream'
-      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400' })
-      res.end(buf)
+      res.writeHead(200, { 'Content-Type': mime, 'Content-Length': buf.length, ...cacheHeaders })
+      res.end(method === 'HEAD' ? undefined : buf)
     } catch (e) {
       res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('logo not found')
     }
@@ -820,10 +1051,136 @@ async function handleRequest(req, res) {
   let relayMode = false
   // 可选 .m3u8 后缀：极影视等播放器按 URL 后缀识别流格式，无后缀会被判定不可播（issue #98 追踪）；
   // 兼容版订阅输出 /relay/<pid>.m3u8，旧的无后缀形式继续支持
-  const relayMatch = routeUrl.match(/^(.*)\/relay\/(\d+)(?:\.m3u8)?((?:\?.*)?)$/)
+  const relayMatch = routeUrl.match(/^(.*)\/relay\/([a-z0-9][a-z0-9_-]{0,63})(?:\.m3u8)?((?:\?.*)?)$/i)
   if (relayMatch) {
     relayMode = true
     routeUrl = `${relayMatch[1]}/${relayMatch[2]}${relayMatch[3]}`
+  }
+
+  // 全代理兼容模式（issue #98 续）：/proxy/<pid>.m3u8 下发的清单里只有同源同目录的相对地址，
+  // 分片走 /proxy/s<key>.<ext> 由服务器转发——给「清单里的绝对地址取不动」的播放器
+  // （极空间极影视：兼容版清单本身完全合法却仍播不了，而同一条 CDN 地址直接填就能播）。
+  // key 带 s 前缀，与频道 ref 天然不冲突；两条路由都必须先于下方「/userId/token」两段解析匹配，
+  // 否则会被拆成账号段。
+  // i 标志与清单路由对齐：个别播放器会把相对地址大写化，漏匹配会静默落进下方账号段解析
+  const proxySegMatch = routeUrl.match(/^.*\/proxy\/(s[0-9a-f]{16})\.[a-z0-9]{1,8}(?:\?.*)?$/i)
+  if (proxySegMatch) {
+    if (method === "OPTIONS") {
+      const client = clientOf(req)
+      if (logOncePer(`options|segment|${client.key}`, 60 * 1000)) {
+        printGrey(`全代理：OPTIONS 分片探测 -> 200｜${client.tag}`)
+      }
+      res.writeHead(200, {
+        'Content-Type': /\.m3u8(?:\?|$)/i.test(routeUrl) ? 'application/vnd.apple.mpegurl' : 'video/mp2t',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, HEAD, OPTIONS',
+        'Access-Control-Allow-Headers': '*',
+      })
+      res.end()
+      return
+    }
+    const target = lookupProxyTarget(proxySegMatch[1].toLowerCase())
+    if (!target) {
+      // 只可能是清单过期后播放器还在拿老地址重试：回 404，播放器会重新拉清单。
+      // 必须打行：这曾是完全静默的分支，「key 过期/被淘汰」与「播放器压根没来」在日志里分不出来
+      const client = clientOf(req)
+      if (logOncePer(`seg404|${proxySegMatch[1]}|${client.key}|${method}`, 10 * 1000)) {
+        printYellow(`全代理分片 key 未登记/已过期，${method} 回 404: ${proxySegMatch[1]}｜${client.tag}`)
+      }
+      res.writeHead(404, { 'Content-Type': 'text/plain;charset=UTF-8' })
+      res.end('分片地址已过期')
+      return
+    }
+    if (method === "HEAD") {
+      // 极影视等严格播放器会先 HEAD 第一个分片；向上游取真实 Content-Length / Accept-Ranges。
+      // 上游不支持 HEAD 或分片需要转换时 probeUpstream 会回退旧的合成 200，GET 行为不变。
+      noteProxySegment(target.pid, req)
+      const started = Date.now()
+      const result = await probeUpstream(target.url, req, res, target.transform, target.upstreamHeaders)
+      logProxyProbe(target.pid, req, result, Date.now() - started)
+      return
+    }
+    // 上游若给的是嵌套子清单（拍平失败时才会出现），同样改写成同源相对地址再下发，
+    // 直接透传会让播放器拿着 CDN 的相对路径去请求本机、必然 404
+    if (/\.m3u8(?:\?|$)/i.test(routeUrl)) {
+      const nested = await fetchNested(target.url, target.upstreamHeaders)
+      if (nested) {
+        const body = Buffer.from(toProxyManifest(
+          rewriteManifest(nested.text, nested.finalUrl),
+          target.pid,
+          target.transform,
+          target.upstreamHeaders,
+          target.upstreamUrlTransform,
+        ), 'utf-8')
+        res.writeHead(200, {
+          'Content-Type': 'application/vnd.apple.mpegurl',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-cache, no-store',
+          'Content-Length': body.length,
+        })
+        res.end(body)
+        return
+      }
+      // 子清单取回失败时不能落到下方分片透传：那会把未改写的清单（内含 CDN 相对路径）
+      // 原样 pipe 给播放器——正是上面注释声明必须避免的形态。回 502 让播放器重试。
+      printYellow(`嵌套子清单取回失败，回 502: ${target.url.split('?')[0]}`)
+      res.writeHead(502, { 'Content-Type': 'text/plain;charset=UTF-8' })
+      res.end('上游子清单获取失败')
+      return
+    }
+    noteProxySegment(target.pid, req)
+    const started = Date.now()
+    const result = await pipeUpstream(target.url, req, res, target.transform, target.upstreamHeaders)
+    logProxySegmentResult(target.pid, req, result, Date.now() - started)
+    return
+  }
+
+  let proxyMode = false
+  let proxyPid = ""
+  // ref 同时兼容咪咕纯数字与模块命名空间（如 gxtv-gxws）。收紧到与模块 id
+  // 同级的安全字符，不能用宽泛的 [^/]+ 把路径/查询串吞进 resolver。
+  const proxyMatch = routeUrl.match(/^(.*)\/proxy\/([a-z0-9][a-z0-9_-]{0,63})(?:\.m3u8)?((?:\?.*)?)$/i)
+  if (proxyMatch) {
+    proxyMode = true
+    proxyPid = proxyMatch[2]
+    routeUrl = `${proxyMatch[1]}/${proxyMatch[2]}${proxyMatch[3]}`
+  }
+
+  // 模块自产的本机媒体（当前用于央视频 VIP 解扰后的 fMP4 HLS）。它不是上游 URL，
+  // 不能塞给 hlsProxy 去 fetch。此处已经完成站长密码/用户令牌鉴权及 relay/proxy
+  // 外壳剥离，但还没把旧 /userId/token 段误拆掉，模块因此能兼容所有入口形态。
+  const localMediaPath = routeUrl.split('?')[0]
+  const localMediaModule = localRequestHandlerFor(localMediaPath)
+  if (localMediaModule) {
+    const local = await localMediaModule.handleLocalRequest({
+      path: localMediaPath,
+      method,
+      headers,
+      accessPrefix,
+    })
+    if (local) {
+      res.writeHead(local.status || 200, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+        'Access-Control-Allow-Headers': '*',
+        ...(local.headers || {}),
+      })
+      if (method === 'HEAD') res.end()
+      else res.end(local.body)
+      return
+    }
+  }
+
+  // 带 relay/proxy 段却没被上面任何一条路由认出（播放器把清单地址当目录拼相对路径、
+  // 多余斜杠等畸形解析）：必须 404 收口。落到下方账号段解析会把 relay/proxy 误当
+  // userId、返回整份订阅 + HTTP 200——播放器拿订阅文本当分片解码必失败且全程无痕。
+  // 豁免 /relay/<pid>/playback.xml：v3.15 时代订阅曾把 relay 段拼进 x-tvg-url，
+  // 存量播放器缓存的 EPG 地址仍走账号段解析取 playback.xml，不能 404。
+  if (!relayMode && !proxyMode && /\/(?:relay|proxy)\//i.test(routeUrl) && !/\/playback\.xml(?:\?|$)/.test(routeUrl)) {
+    printYellow(`无法识别的 relay/proxy 路径，回 404: ${routeUrl.split('?')[0]}｜${clientOf(req).tag}`)
+    res.writeHead(404, { 'Content-Type': 'text/plain;charset=UTF-8' })
+    res.end('地址格式不正确')
+    return
   }
 
   let urlToken = ""
@@ -845,12 +1202,32 @@ async function handleRequest(req, res) {
     urlToken = migu.token || ""
   }
 
-  // 允许HEAD、OPTIONS预检请求
-  if (method === "HEAD" || method === "OPTIONS") {
+  // OPTIONS 与 HEAD 一律本地回答，绝不触发上游解析链。
+  //
+  // 播放器打开订阅时会把里面每个频道逐一探活一遍（APTV 实测：约 2 秒内 HEAD 了 29 个频道）。
+  // 若清单 HEAD 走真实生成链，每个频道都要取一次票再拉一次清单，几十个频道瞬间打出上百个
+  // 上游请求，直接撞上平台按 IP 的频率限制——被限的不只是探活本身，连用户正在看的那个频道
+  // 的分片请求也一起回 403，表现为「有的能播、有的播一会儿卡、有的打不开」。
+  //
+  // 探活只需要知道「这是不是一条可播的 HLS」，答案在 Content-Type 里（issue #98：回
+  // application/json 会被判定不可播）。至于 Content-Length，直播清单每几秒滚动一次、
+  // 长度本就在变，HEAD 报的值与随后 GET 的必然对不上，为这个达不到的准确性付整条解析链
+  // 的代价并不划算。
+  if (method === "OPTIONS" || method === "HEAD") {
+    const streamType = resolverFor(routeUrl.split('?')[0].replace(/^\//, ''))?.streamType
+    if (relayMode || proxyMode) {
+      const client = clientOf(req)
+      const kind = proxyMode ? '全代理' : '兼容'
+      // 频道标识与下方播放日志保持同一形态（不带前导斜杠），排查时两类行才对得上
+      const label = proxyMode ? proxyPid : routeUrl.split('?')[0].replace(/^\//, '')
+      if (logOncePer(`probe|manifest|${routeUrl}|${client.key}|${method}`, 60 * 1000)) {
+        printGrey(`${kind}：${label} ${method} 探活 -> 200（本地应答，未打上游）｜${client.tag}`)
+      }
+    }
     res.writeHead(200, {
       // 清单直出地址按 HLS 类型应答 HEAD 探测：部分播放器播放前先 HEAD 判断类型，
       // 回 application/json 会被判定「不可播放」（issue #98）
-      'Content-Type': relayMode ? 'application/vnd.apple.mpegurl' : 'application/json;charset=UTF-8',
+      'Content-Type': streamType === 'flv' ? 'video/x-flv' : (relayMode || proxyMode) ? 'application/vnd.apple.mpegurl' : 'application/json;charset=UTF-8',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, HEAD, OPTIONS',
       'Access-Control-Allow-Headers': '*'
@@ -859,7 +1236,7 @@ async function handleRequest(req, res) {
     return
   }
 
-  // 其他非GET/POST请求才报错
+  // HEAD/OPTIONS 已在上面本地收口；其他非 GET/POST 请求才报错
   if (method != "GET" && method != "POST") {
     res.writeHead(405, { 'Content-Type': 'application/json;charset=UTF-8' });
     res.end(JSON.stringify({
@@ -879,8 +1256,12 @@ async function handleRequest(req, res) {
   if (interfaceList.indexOf(routeUrlPath) !== -1) {
     // 用户绑定了档则用其绑定档（一人一内容），否则用 query 的 ?profile=
     const effectiveProfile = (currentUser && currentUser.profile) ? currentUser.profile : profileParam
-    // 兼容版订阅（issue #98）：?relay=1 时频道地址输出为 /relay/<pid> 清单直出路径
-    const relayParam = /[?&]relay=1(?:&|$)/.test(routeUrl)
+    // 兼容版订阅（issue #98）：?relay=1 输出 /relay/<pid> 清单直出路径；?relay=2 输出
+    // /proxy/<pid> 全代理路径（分片也经服务器转发）。其他取值按不开启处理。
+    const relayParam = routeUrl.match(/[?&]relay=([12])(?:&|$)/)?.[1] || ''
+    // 订阅拉取留痕（issue #98）：核心排查判据是「播放器拉订阅时带没带 ?relay=、是谁在拉」，
+    // 此前这里零日志，App 二次拉订阅丢参数的场景完全无痕
+    printGrey(`订阅拉取: ${method} ${routeUrlPath}${relayParam ? `?relay=${relayParam}` : '（无 relay 参数）'}｜${clientOf(req).tag}`)
     const interfaceObj = interfaceStr(routeUrlPath, headers, urlUserId, urlToken, effectiveProfile, accessPrefix, relayParam)
     if (interfaceObj.content == null) {
       interfaceObj.content = "获取失败"
@@ -912,9 +1293,35 @@ async function handleRequest(req, res) {
     return
   }
 
-  if (relayMode) {
+  if (result.streamType === 'flv') {
+    const streamed = await pipeFlv(result.playURL, req, res, result.validateMediaUrl)
+    if (!streamed.ok && !streamed.disconnected) printYellow(`FLV 直播 ${routeUrl.split('?')[0]}：${streamed.error}`)
+    return
+  }
+
+  if (relayMode || proxyMode || result.relayHls) {
     // 服务端取回清单、相对路径改写为绝对地址后直出，播放器无需跟随任何跳转
-    const manifest = await fetchManifestDirect(result.playURL)
+    const failKey = proxyMode ? proxyPid : routeUrl.split('?')[0]
+    let manifest = null
+    const manifestDiag = {}
+    if (manifestCooling(failKey)) {
+      // 熔断窗口内：直接走下方 302 回退，不再替播放器把重试打到上游
+      manifestDiag.reason = '熔断窗口内未打上游'
+    } else {
+      manifest = inlineResolvedManifest(result)
+      if (manifest == null) manifest = await fetchManifestDirect(result.playURL, result.upstreamHeaders, manifestDiag)
+      markManifestResult(failKey, manifest != null)
+    }
+    // 全代理：再把清单里的绝对地址换成本机同源相对地址，分片改由 /proxy/s<key>.ts 转发
+    if (manifest != null && proxyMode) {
+      manifest = toProxyManifest(
+        manifest,
+        proxyPid,
+        result.segmentTransform,
+        result.upstreamHeaders,
+        result.upstreamUrlTransform,
+      )
+    }
     if (manifest != null) {
       const body = Buffer.from(manifest, 'utf-8')
       res.writeHead(200, {
@@ -925,14 +1332,26 @@ async function handleRequest(req, res) {
         // 显式 Content-Length（避免 chunked 传输）：部分简易播放器的 HTTP 客户端对分块传输支持不佳
         'Content-Length': body.length,
       });
+      if (proxyMode) logProxyManifest(proxyPid, req, body.length)
       res.end(body)
       return
     }
     // 取清单失败（网络抖动/非 HLS 内容）：回退 302，能跟随跳转的播放器仍可播。
-    // 打一行日志：不跟随跳转的播放器此时会播不了，用户排查时能从日志看出走了回退
-    printYellow(`清单直出取回失败，回退 302（不跟随跳转的播放器将无法播放）: ${routeUrl.split('?')[0]}`)
+    // 打一行日志：不跟随跳转的播放器此时会播不了，用户排查时能从日志看出走了回退。
+    // 同频道每 5 秒一行——播放器失败后是 100ms 级别的连环重试，逐次打印只会淹没日志。
+    if (logOncePer(`manifestfail|${failKey}`, 5 * 1000)) {
+      const reason = manifestDiag.reason ? `｜${manifestDiag.reason}` : ''
+      printYellow(`清单直出取回失败，回退 302（不跟随跳转的播放器将无法播放）: ${routeUrl.split('?')[0]}${reason}`)
+    }
   }
 
+  // 302 成功下发此前全程零日志（issue #98）：播放器拿着旧形态地址回退播放时服务端毫无痕迹。
+  // 每频道每客户端每分钟一行，既留痕又不被 6 秒一次的清单轮询刷屏
+  {
+    const client = clientOf(req)
+    const pidPath = routeUrl.split('?')[0]
+    if (logOncePer(`302|${pidPath}|${client.key}|${method}`, 60 * 1000)) printGrey(`302 跳转下发: ${method} ${pidPath}｜${client.tag}`)
+  }
   res.writeHead(302, {
     'Content-Type': 'application/json;charset=UTF-8',
     location: result.playURL
@@ -956,6 +1375,31 @@ const server = http.createServer((req, res) => {
     } catch { /* 连接可能已断 */ }
   })
 })
+
+let shutdownTask = null
+function shutdownProcess() {
+  if (shutdownTask) return shutdownTask
+  shutdownTask = (async () => {
+    // 先停止接收新连接，再释放专用 Chrome profile；清理最多等 8 秒，不能让
+    // 守护进程的重启因为浏览器异常关闭而无限挂住。
+    try { server.close() } catch { /* 尚未监听或已经关闭 */ }
+    await Promise.race([
+      shutdownModules(),
+      new Promise(resolve => setTimeout(resolve, 8_000)),
+    ])
+    process.exit(0)
+  })()
+  return shutdownTask
+}
+
+process.once('SIGINT', () => { void shutdownProcess() })
+process.once('SIGTERM', () => { void shutdownProcess() })
+
+// Node 默认 keepAliveTimeout 5 秒，而直播媒体清单 TARGETDURATION=6 秒——简易播放器复用
+// 刚被服务端 FIN 掉的连接会撞 RST（issue #98 H5）。拉长到 65 秒覆盖轮询节拍；
+// headersTimeout 必须大于 keepAliveTimeout，否则空闲连接上的下一个请求会被误杀
+server.keepAliveTimeout = 65 * 1000
+server.headersTimeout = 66 * 1000
 
 // 客户端发送畸形 HTTP 或在请求中途断开时，优雅丢弃连接而不是让进程崩溃
 server.on('clientError', (err, socket) => {
@@ -997,6 +1441,9 @@ server.listen(port, async () => {
   // 定时任务2: 每 5 分钟检查外部源、内置源、抓取模块是否到刷新间隔（needsRefresh 按各自间隔判定，不到点不抓）
   // 这一轮本身可能超过 5 分钟（外部源串行且每源之间硬睡 2 秒），必须自己防重入，
   // 否则两轮会同时改同一批状态并写同一个文件，后写者覆盖前者。
+  // 周期默认 5 分钟。msourceTickSeconds 仅供本地测试压缩周期（如 =20），生产不要设
+  const sourceTickMs = (parseInt(process.env.msourceTickSeconds) > 0 ? parseInt(process.env.msourceTickSeconds) : 5 * 60) * 1000
+  if (sourceTickMs !== 5 * 60 * 1000) printYellow(`源刷新检查周期被 msourceTickSeconds 改为 ${sourceTickMs / 1000} 秒（仅供测试）`)
   let sourceTickRunning = false
   setInterval(async () => {
     if (sourceTickRunning) {
@@ -1028,7 +1475,26 @@ server.listen(port, async () => {
     } finally {
       sourceTickRunning = false
     }
-  }, 5 * 60 * 1000); // 每 5 分钟检查一次：让各源的 refreshInterval 被准时执行（此前每小时才 check，间隔不精确）—— issue #73
+  }, sourceTickMs); // 每 5 分钟检查一次：让各源的 refreshInterval 被准时执行（此前每小时才 check，间隔不精确）—— issue #73
+
+  // 需要网页抓取的内置源（纬来体育等）的启动抓取。放到首份播放列表生成之后、不 await 地在
+  // 后台跑：此前它排在启动流程最前面且串行，内网抓不到时一轮十几分钟，其它所有源都得等它。
+  // 抓到了走「仅重新生成播放列表」把新地址补进去；抓取本身有防重入，5 分钟 tick 撞上会跳过。
+  // 抓不抓只看内置源清单里每个源自己的 updateOnStartup（与搬过来之前一致）；外部源那个全局
+  // updateOnStartup 是咪咕的「重启时更新」开关（见 externalSources.js setUpdateOnStartup），不管这里
+  async function refreshBuiltInSourcesAfterStartup() {
+    try {
+      printBlue("启动模式：后台抓取需要网页抓取的内置源...")
+      const result = await updateBuiltInSources({ startupMode: true })
+      if (Array.isArray(result?.results) && result.results.some(r => r.success)) {
+        printBlue("内置源启动抓取拿到新地址，重新生成播放列表...")
+        await update(hours, { regenerateOnly: true })
+        printGreen("播放列表已补入内置源最新地址")
+      }
+    } catch (error) {
+      printRed(`内置源启动抓取失败: ${error?.message || error}`)
+    }
+  }
 
   try {
     // 初始化数据（启动模式）
@@ -1037,6 +1503,8 @@ server.listen(port, async () => {
     console.log(error)
     printRed("更新失败")
   }
+
+  void refreshBuiltInSourcesAfterStartup()
 
   // 启动后检查：如果有订阅源首次获取失败（parsedChannels 为空），60秒后自动重试
   setTimeout(async () => {

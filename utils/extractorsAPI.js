@@ -159,6 +159,64 @@ export async function pollModuleLoginAPI(id, key) {
   }
 }
 
+/**
+ * 持久浏览器登录流程。与上面的二维码 loginFlow 分开：这里没有要写进
+ * extractors.json 的 token，登录态只留在模块自己的浏览器 profile 中。
+ */
+function safeBrowserLoginState(value = {}) {
+  const account = value.account && typeof value.account === 'object'
+    ? {
+        nickname: String(value.account.nickname || '').slice(0, 120),
+        type: String(value.account.type || '').slice(0, 40),
+        vip: value.account.vip === true,
+      }
+    : null
+  return {
+    status: String(value.status || 'idle').slice(0, 32),
+    message: String(value.message || '').slice(0, 500),
+    active: value.active === true,
+    available: value.available !== false,
+    reason: String(value.reason || '').slice(0, 500),
+    running: value.running === true,
+    visible: value.visible === true,
+    authenticated: value.authenticated === true,
+    account,
+  }
+}
+
+function browserLoginModule(id, method) {
+  const module = getModule(id)
+  if (!module?.browserLoginFlow || typeof module.browserLoginFlow[method] !== 'function') {
+    throw new Error(`${id} 不支持浏览器登录${method === 'status' ? '状态查询' : ''}`)
+  }
+  return module
+}
+
+async function runBrowserLoginAction(id, method, ...args) {
+  try {
+    const module = browserLoginModule(id, method)
+    const state = await module.browserLoginFlow[method](...args)
+    return { success: true, data: safeBrowserLoginState(state) }
+  } catch (error) {
+    return fail(error)
+  }
+}
+
+export const startBrowserLoginAPI = id => runBrowserLoginAction(id, 'start')
+export const getBrowserLoginStatusAPI = id => runBrowserLoginAction(id, 'status')
+export const checkBrowserLoginAPI = id => runBrowserLoginAction(id, 'check')
+export const cancelBrowserLoginAPI = id => runBrowserLoginAction(id, 'cancel')
+export const closeBrowserLoginAPI = id => runBrowserLoginAction(id, 'close')
+/**
+ * 导入用户在自己浏览器里拿到的登录态（Docker / NAS 没有桌面、弹不出登录窗时的路径）。
+ * 内容只透传给模块种进它自己的浏览器 profile，本层不解析、不落盘、不进 extractors.json。
+ */
+export const importBrowserLoginAPI = (id, payload) => {
+  if (typeof payload !== 'string' || !payload.trim()) return fail(new Error('请先粘贴登录态内容'))
+  if (payload.length > 64 * 1024) return fail(new Error('登录态内容过长'))
+  return runBrowserLoginAction(id, 'import', payload)
+}
+
 /** 单模块开关。 */
 export function setExtractorEnabledAPI(id, enabled) {
   try {

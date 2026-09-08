@@ -2,11 +2,14 @@
  * 抓取模块：哔哩哔哩直播。
  *
  * 模块契约（见 extractors/registry.js 顶部注释）里，本模块用到的部分：
- *   fetch(config, ctx) → { groups: [{name, dataList}], meta }
- * 不实现 resolve()——B 站的地址是直链（带 expires token，约 2 小时过期），
- * 靠 defaultRefreshMinutes 的短周期刷新兜住，不需要播放时二次解析。
+ *   fetch(config, ctx)  → { groups: [{name, dataList}], meta }   只挑直播间，频道落 deferredRef
+ *   resolve(ref, ctx)   → { url, desc, relayHls, upstreamHeaders }  播放时才换签名地址
+ * 早先它是直链模块：把带 expires 的地址直接写进播放列表、靠 45～90 分钟刷新兜
+ * 「约 2 小时」过期。实测签名只有 60 分钟，且播放器不重拉列表就拿不到新地址，
+ * 表现为「每隔一段时间全部失效、手动刷新才恢复」（issue #120）——改成与虎牙 /
+ * 斗鱼同款的播放时解析 + 本机中继清单后，播放列表里的地址永远有效。
  */
-import { resolveRoom, parseRoomList, mapLimit, areaList, topRoomsOfArea, qrLoginStart, qrLoginPoll, RiskControlError, RoomOfflineError, DEFAULT_GROUP } from './api.js'
+import { fetchRoom, resolveRoom, claimsRef, clearResolveCache, parseRoomList, mapLimit, areaList, topRoomsOfArea, qrLoginStart, qrLoginPoll, RiskControlError, RoomOfflineError, BILIBILI_GROUP, DEFAULT_MIN_ONLINE } from './api.js'
 
 // 并发上限。B 站对短时间内的大量请求会回 -352，实测 3 路是安全且够快的折中；
 // 外部源那边「串行 + 每个之间硬睡 2 秒」的做法在房间数上去之后是分钟级，不抄。
@@ -57,6 +60,26 @@ export function mergeRoomRefs(manual, auto) {
 }
 
 /**
+ * 不论直播间原本属于赛事 / 娱乐 / 网游等哪个 B 站分区，播放列表统一归到「B站」。
+ * 分区仍用于热门榜选房间，只是不再泄漏成 IPTV 的顶层分组，避免用户选多个分区后
+ * 侧边栏被拆成一串含义过宽的「赛事」「娱乐」组。
+ */
+export function groupBilibiliResults(results, warnings = []) {
+  const dataList = []
+  const seenRooms = new Set()
+  for (const result of results || []) {
+    if (!result) continue
+    if (result.roomId) {
+      if (seenRooms.has(result.roomId)) continue
+      seenRooms.add(result.roomId)
+    }
+    if (result.warning) warnings.push(result.warning)
+    dataList.push({ ...result.channel, groupTitle: BILIBILI_GROUP })
+  }
+  return dataList.length ? [{ name: BILIBILI_GROUP, dataList }] : []
+}
+
+/**
  * 按配置的分区名，取各分区人气前 N 的直播间。
  *
  * 存在的理由：不这么做的话，用户想用 B 站直播就得自己去网页上一个个找房间号——
@@ -104,8 +127,8 @@ async function collectTopRooms(config, ctx) {
       continue
     }
     try {
-      // topRoomsOfArea 内部已经滤过人气下限并截到 perArea 个（见 selectTopRooms）
-      rooms.push(...await topRoomsOfArea(id, perArea, options))
+      // topRoomsOfArea 内部已经按用户配置滤过人气下限并截到 perArea 个（见 selectTopRooms）
+      rooms.push(...await topRoomsOfArea(id, perArea, { ...options, minOnline: config.minOnline }))
     } catch (error) {
       // 风控要往上抛：让 health() 报「被风控」而不是一条不起眼的 warning
       if (error instanceof RiskControlError) throw error
@@ -120,15 +143,18 @@ async function collectTopRooms(config, ctx) {
 export default {
   id: 'bilibili-live',
   name: '哔哩哔哩直播',
-  description: '把 B 站直播间变成频道。地址带防盗链，靠 #EXTVLCOPT 传请求头才能播。',
+  description: '按分区加入 B 站热门直播间，也可手动指定房间；播放时即时换取一小时有效的地址，本机中继清单并补齐防盗链请求头。',
+  category: 'live',
 
-  // 直链模块：结果小（一个房间一条），可以落盘缓存，失败时用它兜底。
-  capabilities: { cache: 'disk', resolve: false, epg: false },
+  // 结果小（一个房间一条）、只有房间名单没有短效地址，可以落盘缓存，失败时用它兜底。
+  capabilities: { cache: 'disk', resolve: true, epg: false },
 
-  // 流地址约 2 小时过期，留出 1~2 轮重试余量。
-  // 注意别照抄外部源的 240 分钟默认值（utils/externalSources.js 的 refreshInterval），
-  // 那对 2 小时过期的源是致命的。
+  // 刷新周期只决定多久重挑一次直播间（热门榜换人、主播下播）；播放地址在播放时
+  // 现换，与这里无关。下限 15 是给风控留的余量（一轮约 3 个请求 × 房间数），
+  // 上限与虎牙 / 斗鱼对齐；默认沿用 45，老用户存过的值不会越界回落。
   defaultRefreshMinutes: 45,
+  minRefreshMinutes: 15,
+  maxRefreshMinutes: 120,
 
   // 后台在这个模块的卡片里额外渲染一块助手 UI（markup 在 admin.html，与咪咕的
   // migu-bookmarklet 同款约定：具体长相属于前端，模块只声明「我要哪一块」）。
@@ -156,17 +182,26 @@ export default {
       key: 'topAreas',
       section: '频道从哪来 —— 两种可以同时用，结果取并集（重复的直播间只出现一次，手填的排在前面）',
       group: '① 自动：按分区加入热门直播间',
-      label: '分区（一行一个）',
-      type: 'text',
-      multiline: true,
-      placeholder: '一行一个分区名\n赛事\n网游\n# 井号开头是注释',
-      // 默认「赛事」：那是 B 站的官方赛事转播区，人气比普通直播区高一个数量级
-      //（实测 3921 万 vs 254 万），内容全是正在打的比赛、不会混进普通主播，
-      // 是「不用自己找房间号也能开箱即用」这件事最合适的默认值。
-      default: '赛事',
-      // 注意别写「留空＝关闭」：文本清空保存＝回到没配过（稀疏存储约定），会
-      // 回落默认「赛事」而不是关闭——真想关自动加入的口子是 topPerArea 填 0。
-      hint: '推荐用这个，不用自己找房间号。默认「赛事」＝当前正在打的比赛（英雄联盟 / 王者 / DOTA2 等官方赛事转播）。可填：赛事 / 网游 / 手游 / 单机游戏 / 娱乐 / 电台 / 虚拟主播 / 聊天室 / 生活 / 知识 / 互动玩法 / 购物；写错会在上面的健康状态里提示。清空保存会回到默认「赛事」；想只用右边手填的，把下面「每个分区取前几名」填 0。',
+      label: '选择分区（可多选）',
+      type: 'multiselect',
+      options: [
+        { value: '赛事', label: '赛事' },
+        { value: '知识', label: '知识' },
+        { value: '生活', label: '生活' },
+        { value: '网游', label: '网游' },
+        { value: '手游', label: '手游' },
+        { value: '单机游戏', label: '单机游戏' },
+        { value: '娱乐', label: '娱乐' },
+        { value: '电台', label: '电台' },
+        { value: '虚拟主播', label: '虚拟主播' },
+        { value: '聊天室', label: '聊天室' },
+        { value: '互动玩法', label: '互动玩法' },
+        { value: '购物', label: '购物' },
+      ],
+      // 「赛事 + 知识」兼顾官方比赛与新闻 / 教育 / 科普，适合电视端长时间观看；
+      // 每区最多 8 路且仍受最低人气过滤，合并到一个 B站 组后总量也可控。
+      default: '赛事\n知识',
+      hint: '默认勾选「赛事、知识」。至少选择一个；想只用右边手填的直播间，把下面「每个分区取前几名」设为 0。所有频道在播放列表里统一归入「B站」组。',
     },
     {
       key: 'topPerArea',
@@ -180,6 +215,17 @@ export default {
       // 「第五人格 IVL 夏季赛总决赛」这种 300 万人在看的比赛。8 正好覆盖到断崖处。
       default: 8,
       hint: '按人气从高到低，是上限不是保证。人气过低的会被自动滤掉（免得把同一场比赛的多机位小号也拉进来），所以清闲时段实际条数会少于这个值。填 0 ＝ 只关掉左边这一列，右边手填的照常生效。',
+    },
+    {
+      key: 'minOnline',
+      section: '频道从哪来 —— 两种可以同时用，结果取并集（重复的直播间只出现一次，手填的排在前面）',
+      group: '① 自动：按分区加入热门直播间',
+      label: '最低人气',
+      type: 'int',
+      min: 0,
+      max: 100000000,
+      default: DEFAULT_MIN_ONLINE,
+      hint: '低于该人气的直播间不自动加入。B 站“人气”不是实际观看人数且量级会调整；默认 3000 能保留多数正常赛事并过滤低热度重复机位。填 0 ＝ 不设人气门槛。',
     },
     {
       key: 'rooms',
@@ -205,31 +251,16 @@ export default {
       hint: '不填也能用，但画质会被限制在「超清」。填了才有「原画」。等同登录态，别外传。',
       default: '',
     },
-    {
-      key: 'preferHls',
-      section: '播放偏好',
-      label: '优先 HLS',
-      type: 'boolean',
-      hint: '关掉则优先 FLV。HLS 是分段的，中途卡顿后播放器更容易自己恢复。',
-      default: true,
-    },
+    // 直链时代的「优先 HLS」「播放缓冲」已下线：播放时解析统一走 HLS 清单中继
+    // （FLV 得由本机整条转发，白占 NAS 带宽），缓冲提示则从来到不了订阅端
+    // （omitPlayerOnlyOpts 会剥掉）。旧配置里残留的这两个键会被 resolveConfig 忽略。
     {
       key: 'preferAvc',
       section: '播放偏好',
       label: '优先 H.264',
       type: 'boolean',
-      hint: '关掉则优先 HEVC（H.265）。老电视盒子多数解不了 HEVC，默认开着更稳。',
+      hint: '关掉则优先 HEVC（H.265）。老电视盒子多数解不了 HEVC，默认开着更稳。改动后下一次播放生效。',
       default: true,
-    },
-    {
-      key: 'cachingMs',
-      section: '播放偏好',
-      label: '播放缓冲 (ms)',
-      type: 'int',
-      min: 0,
-      max: 60000,
-      hint: '写进 #EXTVLCOPT:network-caching。家宽上直播流缓冲小了容易卡，0 表示不写。',
-      default: 3000,
     },
   ],
 
@@ -262,10 +293,9 @@ export default {
 
     const options = {
       cookie: config.sessdata ? `SESSDATA=${config.sessdata}` : '',
-      preferHls: config.preferHls !== false,
       preferAvc: config.preferAvc !== false,
-      cachingMs: Number(config.cachingMs) || 0,
       timeoutMs: ctx.timeoutMs || 10000,
+      fetchImpl: ctx.fetchImpl,
     }
 
     const skipped = []
@@ -283,7 +313,7 @@ export default {
 
     const results = await mapLimit(refs, CONCURRENCY, async (ref) => {
       try {
-        return await resolveRoom(ref, options)
+        return await fetchRoom(ref, options)
       } catch (error) {
         // 风控是全局性的：记下来，等这一轮跑完统一往上抛，让 health() 报
         // 「被风控」而不是一串「未开播」——后者会让用户以为主播都下播了。
@@ -302,25 +332,11 @@ export default {
 
     if (riskControl) throw riskControl
 
-    // 按 B 站分区归组，与咪咕/外部源的 [{name, dataList}] 同构。
+    // 所有 B 站频道统一归到「B站」组，与咪咕/外部源的 [{name, dataList}] 同构。
     // mergeRoomRefs 只按用户填的字面量去重，URL / 短号 / 短链写法各异时同一间房
     // 会漏网（rooms 字段还推荐「直接粘完整地址」）——这里按归一后的真实房间号
     // 再去一次重。refs 手填在前、mapLimit 按下标写结果，保留首个即保留手填优先序。
-    const byGroup = new Map()
-    const seenRooms = new Set()
-    for (const result of results) {
-      if (!result) continue
-      if (result.roomId) {
-        if (seenRooms.has(result.roomId)) continue
-        seenRooms.add(result.roomId)
-      }
-      if (result.warning) warnings.push(result.warning)
-      const groupName = result.group || DEFAULT_GROUP
-      if (!byGroup.has(groupName)) byGroup.set(groupName, { name: groupName, dataList: [] })
-      byGroup.get(groupName).dataList.push(result.channel)
-    }
-
-    const groups = [...byGroup.values()]
+    const groups = groupBilibiliResults(results, warnings)
 
     if (shouldFailRound(groups.length, hardErrors)) {
       // 归因要分账：热门榜接口失败与直播间获取失败是两码事，混着算分子会把
@@ -337,4 +353,8 @@ export default {
       meta: { skipped, warnings, requested: refs.length, hardErrors },
     }
   },
+
+  claimsRef,
+  resolve: resolveRoom,
+  clearResolveCache,
 }

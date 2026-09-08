@@ -1,10 +1,14 @@
 import { readFileSync } from "./fileUtil.js";
 import { dataPath } from "./paths.js";
-import { host, pass, enableTvgNormalize } from "../config.js";
+import { host, pass, enableTvgNormalize, enableDisplayNameUnify } from "../config.js";
 import { printDebug, printGreen, printGrey, printRed, printYellow } from "./colorOut.js";
 import { readConfig, parseInterfaceTxt, applyConfig, generateM3u8, generateTxt } from "./playlistConfig.js";
+import { getKeywordGroupRules } from "./groupRulesAPI.js";
+import { hasSourceFallbackGroups } from "./sourceGroupFallback.js";
 import { resolverFor, listModules } from "../extractors/registry.js";
 import { getExtractorManager, getModuleConfig } from "./extractorManager.js";
+import { omitPlayerOnlyOpts } from "./channelOpts.js";
+import { fetchUpstreamResponse } from "./hlsProxy.js";
 
 /**
  * 清空各模块的解析缓存。
@@ -23,6 +27,10 @@ function clearUrlCache() {
 // 覆盖两类位置：URI 行（非 # 开头的行）与标签内的 URI="..." 属性（EXT-X-KEY/MEDIA/MAP 等）。
 // 纯字符串处理、无副作用，便于单测。
 function rewriteManifest(text, finalUrl) {
+  // 行尾/BOM 归一化：上游若是 \r\n，按 \n 切分后 # 标签行会保留 \r 而 URI 行被 trim 成
+  // 裸 \n——混合行尾清单会让严格按 \r\n 分行的播放器拿到脏 URI（issue #98）。
+  // 这里是 relay/proxy 全部清单的必经点，归一次即可覆盖所有下发路径。
+  text = text.replace(/^\uFEFF/, '').replace(/\r/g, '')
   return text.split('\n').map(line => {
     const t = line.trim()
     if (!t) return line
@@ -35,16 +43,59 @@ function rewriteManifest(text, finalUrl) {
   }).join('\n')
 }
 
-// 取回一份 HLS 清单文本（跟随 302），非 200 或非 HLS 内容返回 null
-async function fetchHls(url, signal) {
-  const resp = await fetch(url, {
-    redirect: 'follow',
+// 个别 CDN 只向真实 Chromium 返回清单。对应模块可在 resolve() 中直接交回本轮
+// manifestText + manifestUrl；这里仍统一做相对地址绝对化，后续 relay/proxy 逻辑无需分叉。
+function inlineResolvedManifest(result) {
+  const text = typeof result?.manifestText === 'string' ? result.manifestText : ''
+  const base = String(result?.manifestUrl || result?.playURL || '')
+  if (!text.trimStart().startsWith('#EXTM3U') || text.length > 2 * 1024 * 1024) return null
+  try {
+    const url = new URL(base)
+    if (!['http:', 'https:'].includes(url.protocol)) return null
+    return rewriteManifest(text, url.href)
+  } catch {
+    return null
+  }
+}
+
+// 日志里只留主机 + 路径：query 里通常是签名/令牌，落日志等于泄露可播地址
+function urlForLog(url) {
+  try {
+    const u = new URL(url)
+    return `${u.host}${u.pathname}`
+  } catch {
+    return String(url).split('?')[0]
+  }
+}
+
+// 上游拒绝时把正文头部带进日志：403 的正文往往直接写着 CDN 的拒绝理由（防盗链 / 令牌过期 / 地区限制）
+function bodySnippet(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    // 个别 CDN 的错误页会把请求地址连同令牌一起回显，落日志前抹掉
+    .replace(/\b(token|sign|auth|key)=[^&\s"'<]+/gi, '$1=<已隐藏>')
+    .trim()
+    .slice(0, 120)
+}
+
+// 取回一份 HLS 清单文本（跟随 302），非 200 或非 HLS 内容返回 null。
+// 失败时把原因写进 diag.reason：此前这里静默返回 null，用户日志只剩一行「取回失败」，
+// CDN 到底回了 403 还是回了一页 HTML，排查者对着日志猜不出来（北京时间电视台就卡在这一步）。
+async function fetchHls(url, signal, upstreamHeaders = {}, diag = {}) {
+  const resp = await fetchUpstreamResponse(url, {
     signal,
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+    upstreamHeaders,
   })
-  if (!resp.ok) return null
+  const type = resp.headers.get('content-type') || '未知类型'
   const text = await resp.text()
-  if (!text.trimStart().startsWith('#EXTM3U')) return null
+  if (!resp.ok) {
+    diag.reason = `上游 ${urlForLog(resp.url || url)} 回 HTTP ${resp.status}（${type}）${text.trim() ? ` 正文: ${bodySnippet(text)}` : ''}`
+    return null
+  }
+  if (!text.trimStart().startsWith('#EXTM3U')) {
+    diag.reason = `上游 ${urlForLog(resp.url || url)} 回 HTTP ${resp.status} 但不是 HLS 清单（${type}）${text.trim() ? ` 正文: ${bodySnippet(text)}` : ' 正文为空'}`
+    return null
+  }
   return { text, finalUrl: resp.url || url }
 }
 
@@ -75,24 +126,27 @@ function firstVariantUrl(text, base) {
 //
 // 注意：清单由服务端取回，节点由服务端网络选择，与「客户端就近取流」语义互斥——
 // 兼容模式面向 NAS 与播放设备同一网络的家庭场景，正好不需要就近取流。
-// 返回 null 表示取清单失败或内容不是 HLS，调用方应回退 302。
-async function fetchManifestDirect(playURL) {
+// 返回 null 表示取清单失败或内容不是 HLS，调用方应回退 302；失败原因写进 diag.reason，
+// 由调用方拼进它自己那行限流过的「取回失败」日志，不在这里另起一行。
+async function fetchManifestDirect(playURL, upstreamHeaders = {}, diag = {}) {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 10000)   // 覆盖两跳
   try {
-    const master = await fetchHls(playURL, ctrl.signal)
+    const master = await fetchHls(playURL, ctrl.signal, upstreamHeaders, diag)
     if (!master) return null
 
     const variantUrl = firstVariantUrl(master.text, master.finalUrl)
     if (variantUrl) {
-      const media = await fetchHls(variantUrl, ctrl.signal)
+      const media = await fetchHls(variantUrl, ctrl.signal, upstreamHeaders)
       // 拍平成功：直接给播放器分片列表；失败则退回改写后的 master（跟随能力正常的播放器仍可播）
       if (media) return rewriteManifest(media.text, media.finalUrl)
       printDebug(`子清单取回失败，退回 master 清单: ${variantUrl}`)
     }
     return rewriteManifest(master.text, master.finalUrl)
   } catch (error) {
-    printDebug(`清单直出取回失败，回退 302: ${error.message}`)
+    diag.reason = error?.name === 'AbortError'
+      ? `上游 ${urlForLog(playURL)} 10 秒内没有回清单（超时）`
+      : `上游 ${urlForLog(playURL)} 请求出错: ${error?.message || error}`
     return null
   } finally {
     clearTimeout(timer)
@@ -148,9 +202,12 @@ function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix, 
       // 只有存在任意自定义配置时才应用（避免首次访问解析失败）
       // 注意：旧写法 `config.channelGroupMap` 恒真（{} 也为真），会导致始终套用配置；
       // 这里改为按内容判断，并补上 groupRenameMap / customGroups / groupSortMode
-      // 另外：EPG 名称规整（issue #39）默认对所有人生效，故开关开启时也要走 applyConfig（即使无任何自定义配置）
+      // 另外：EPG 名称规整（issue #39）/ 统一显示名（issue #56）默认对所有人生效，故开关开启时也要走 applyConfig（即使无任何自定义配置）
+      // 关键字自动分组（issue #69）与「忽略源自带分组」的默认分组兜底（issue #110）
+      // 同为全局配置、不落在任何配置档里，存在时零个性化配置的档也必须走 applyConfig
       if (config && (
         enableTvgNormalize ||
+        enableDisplayNameUnify ||
         Object.keys(config.channelGroupMap || {}).length > 0 ||
         Object.keys(config.channelRenameMap || {}).length > 0 ||
         Object.keys(config.channelOrder || {}).length > 0 ||
@@ -160,7 +217,9 @@ function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix, 
         config.deletedGroups?.length > 0 ||
         config.customGroups?.length > 0 ||
         config.groupOrder?.length > 0 ||
-        config.disabledSources?.length > 0)) {   // 按档禁用源（issue #29/#68）也需触发 applyConfig
+        config.disabledSources?.length > 0 ||    // 按档禁用源（issue #29/#68）也需触发 applyConfig
+        getKeywordGroupRules().length > 0 ||
+        hasSourceFallbackGroups())) {
         printGrey("应用播放列表自定义配置")
         const groups = parseInterfaceTxt()
         const configuredGroups = applyConfig(groups, config)
@@ -213,18 +272,35 @@ function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix, 
   }
 
   // 兼容版订阅（?relay=1，issue #98）：频道地址改为 /relay/<pid> 清单直出路径，
-  // 供不跟随 302 跳转的播放器（极空间极影视、部分老电视盒）使用。
+  // 供不跟随 302 跳转的播放器（极空间极影视、部分老电视盒）使用；
+  // ?relay=2 为全代理版：频道地址改为 /proxy/<pid>，连分片也经服务器转发。
   // 只匹配「${replace}/纯数字」的咪咕频道地址；x-tvg-url 的 playback.xml、外部源直链不受影响。
   // 用路径前缀而非 query 参数：m3u 头的 catchup-source 以 "?" 开头直接拼在频道地址后，
   // query 方案会拼出双问号破坏回看，路径方案天然兼容。
+  // relay=2（全代理版）再进一步：清单里的分片地址也改回本机，由服务器转发——
+  // 给「兼容版清单完全合法却仍播不了、同一条 CDN 地址直接填却能播」的播放器（极影视，issue #98）
   if (relay) {
     // 带 .m3u8 后缀：极影视等播放器按 URL 后缀识别流格式，无后缀会被判定不可播（issue #98 追踪）
-    result.content = `${result.content}`.replace(/\$\{replace\}\/(\d+)/g, '${replace}/relay/$1.m3u8')
+    const seg = String(relay) === '2' ? 'proxy' : 'relay'
+    result.content = `${result.content}`.replace(/\$\{replace\}\/(\d+)/g, '${replace}/' + seg + '/$1.m3u8')
+    if (String(relay) === '2') {
+      // 命名空间模块通常已经把地址写成 /relay/<ref>.m3u8。只有模块明确确认
+      // 服务端也能拉取其分片时才升级，避免破坏央视频等拒绝服务端分片的 CDN。
+      result.content = `${result.content}`.replace(
+        /\$\{replace\}\/relay\/([a-z0-9][a-z0-9_-]{0,63})\.m3u8/gi,
+        (whole, ref) => resolverFor(ref)?.relayProxyCompatible === true
+          ? `\${replace}/proxy/${ref}.m3u8`
+          : whole,
+      )
+    }
   }
 
   // 剥离内部属性 source-ids（issue #29/#68 源归属标记）后再输出给播放器：
   // 覆盖两条路径——原始 interface.txt 直出 与 applyConfig 重生成（generateM3u8 不写该属性，正则兜底无副作用）
   result.content = `${result.content}`.replace(/ source-ids="[^"]*"/g, "").replaceAll("${replace}", replaceHost);
+
+  // 原始缓存直出和配置档重生成都在这里处理；TXT 没有 M3U 选项，EPG 已提前返回。
+  if (url !== '/txt') result.content = omitPlayerOnlyOpts(result.content)
 
   return result
 }
@@ -292,7 +368,7 @@ async function channel(url, urlUserId, urlToken) {
 
   // 添加回放参数。必须是裸字符串拼接——统一用 new URL()/URLSearchParams 构造
   // 会把 puData / ddCalcu 里的原始字符重新编码，签名当场失效。
-  if (params != "") {
+  if (params != "" && module.capabilities?.catchup !== false) {
     const resultParams = new URLSearchParams(params);
     for (const [key, value] of resultParams) {
       playURL = `${playURL}&${key}=${value}`
@@ -301,7 +377,20 @@ async function channel(url, urlUserId, urlToken) {
 
   result.code = 302
   result.playURL = playURL
+  // 仅在 /proxy/ 全代理链里消费；普通 302/relay 不会执行平台分片变换。
+  result.segmentTransform = resolved.segmentTransform
+  // 平台要求的上游请求头只在服务端清单/分片代理链消费，不下发给客户端。
+  result.upstreamHeaders = resolved.upstreamHeaders
+  // 个别平台要求每一条子清单/分片路径分别签名；仅全代理登记上游地址时调用。
+  result.upstreamUrlTransform = resolved.upstreamUrlTransform
+  // 浏览器指纹保护平台可直接交回已经读取到的 HLS；只在清单代理链消费。
+  result.manifestText = resolved.manifestText
+  result.manifestUrl = resolved.manifestUrl
+  // 平台可要求旧的无后缀入口也直出动态 HLS 清单；用于兼容已收藏/已下发的旧地址。
+  result.relayHls = resolved.relayHls === true
+  result.streamType = module.streamType || 'hls'
+  result.validateMediaUrl = resolved.validateMediaUrl
   return result
 }
 
-export { interfaceStr, channel, clearUrlCache, fetchManifestDirect, rewriteManifest, firstVariantUrl }
+export { interfaceStr, channel, clearUrlCache, fetchManifestDirect, rewriteManifest, firstVariantUrl, inlineResolvedManifest }

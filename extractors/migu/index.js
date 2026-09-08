@@ -35,7 +35,8 @@ import { enableMigu } from "../../config.js"
 import { setSystemFlagAPI } from "../../utils/systemConfigAPI.js"
 
 /**
- * 跨分组去重：同一个 pID 只留在**最先出现**的那个分组里。
+ * 跨分组去重：同一个 pID 只留在**最先出现**的那个分组里；
+ * CCTV5 / CCTV5+ 是明确例外，同时保留在「体育」和「央视」。
  *
  * 咪咕按自己的分类给同一个频道打多个标签：CCTV1 同时出现在 央视/影视/新闻/纪实，
  * 四份**完全一样**——同名、同 tvg-id、同地址，只有 group-title 不同。代价都是实的：
@@ -46,9 +47,10 @@ import { setSystemFlagAPI } from "../../utils/systemConfigAPI.js"
  *     4 次，而界面上没有任何地方提示还有另外 3 份；
  *   · 频道数虚高：实测 645 个条目对应 593 个真实频道，47 个频道跨分组重复。
  *
- * 顺序**不在这里定义**，原样沿用 fetchList.cateList() 拿到的咪咕分类顺序
- *（当前 体育/央视/卫视/地方/影视/新闻/教育/熊猫/综艺/少儿/纪实）。所以「先出现者胜」
- * 等价于「按咪咕自己的分类优先级归属」：CCTV5 落在体育、其余 CCTV 落在央视。
+ * 顺序**不在这里定义**，除「地方」经 redistributeMiguLocalChannels
+ * 收窄并归类外，原样沿用 fetchList.cateList() 拿到的咪咕分类顺序。所以
+ * 「先出现者胜」等价于「按咪咕自己的分类优先级归属」；CCTV5 / CCTV5+
+ * 因用户需要在体育和央视两个入口中都能找到，只对这两台放开双分组。
  * 刻意不另立一张优先级表——两处各自定义顺序必然走偏。
  *
  * 去重只在**咪咕模块内部**按 pID 做，绝不跨源：「咪咕的 CCTV1 + 精选频道的 CCTV1」
@@ -59,10 +61,20 @@ import { setSystemFlagAPI } from "../../utils/systemConfigAPI.js"
  */
 export function dedupeAcrossGroups(groups) {
   const seen = new Set()
+  const seenExceptions = new Set()
   const out = []
   for (const group of groups) {
     const dataList = group.dataList.filter(item => {
       const key = String(item.pID)
+      const keepInBoth = (group.name === '体育' || group.name === '央视')
+        && (item.name === 'CCTV5体育' || item.name === 'CCTV5+体育赛事')
+      if (keepInBoth) {
+        const groupKey = `${key}::${group.name}`
+        if (seenExceptions.has(groupKey)) return false
+        seenExceptions.add(groupKey)
+        seen.add(key)
+        return true
+      }
       if (seen.has(key)) return false
       seen.add(key)
       return true
@@ -71,6 +83,71 @@ export function dedupeAcrossGroups(groups) {
     if (dataList.length > 0) out.push({ ...group, dataList })
   }
   return out
+}
+
+// 咪咕「地方」分组与免登录的地方官方模块大量重复，而且咪咕高画质
+// 受账号/VIP 限制。最终播放列表不再输出「地方」，只保留官方模块
+// 尚未覆盖且用户明确要保留的频道，并直接并入对应地区。精确白名单刻意
+// 不自动接纳咪咕后续新增的地方频道，避免重复项刷新后悄悄复活。
+// 「上视东方影视」曾在此列并入上海，实测播放不了，已移到下方剔除名单。
+export const MIGU_LOCAL_REASSIGNMENTS = Object.freeze({
+  '陕西银龄频道': '陕西',
+  '陕西都市青春频道': '陕西',
+  '陕西秦腔频道': '陕西',
+  '陕西新闻资讯频道': '陕西',
+  '财富天下': '江苏',
+})
+
+// 这些地方频道还会出现在「新闻」等分类里，因此需要在
+// 所有咪咕分类中全局剔除，避免删掉「地方」组后又从别组复活。
+export const MIGU_CHANNEL_EXCLUSIONS = new Set([
+  // 咪咕这路取不到流、播不了；全局剔除，免得换个分类又冒出来
+  '上视东方影视',
+  '中国天气',
+  '公共新闻频道',
+  '新动力量创一流',
+  '梨园频道',
+  '海南广播电视总台社会与法频道',
+  '海南广播电视总台文旅频道',
+  '淮安新闻综合',
+  '宿迁新闻综合',
+  '徐州新闻综合',
+  '盐城新闻综合',
+  '江阴新闻综合',
+  '南通新闻综合',
+  '宜兴新闻综合',
+  '溧水新闻综合',
+  '镇江新闻综合',
+  '海南广播电视总台新闻频道',
+])
+
+/** 清理咪咕地方重复源，并把少数保留频道合并进地区分组。 */
+export function redistributeMiguLocalChannels(groups) {
+  const output = []
+  const append = (name, channels) => {
+    if (!channels.length) return
+    const existing = output.find(group => group.name === name)
+    if (existing) existing.dataList.push(...channels)
+    else output.push({ name, dataList: [...channels] })
+  }
+
+  for (const group of Array.isArray(groups) ? groups : []) {
+    // 咪咕「综艺」只有一条专题轮播和一条已由江苏官方模块
+    // 提供的重复频道，单独保留该分组意义不大，整组不输出。
+    // 「熊猫」11 路已由 iPanda 官方模块免登录提供，咪咕这份是画质更差的重复，整组不输出。
+    if (group?.name === '综艺' || group?.name === '熊猫') continue
+    const channels = (Array.isArray(group?.dataList) ? group.dataList : [])
+      .filter(channel => !MIGU_CHANNEL_EXCLUSIONS.has(String(channel?.name || '').trim()))
+    if (group?.name !== '地方') {
+      append(group?.name, channels)
+      continue
+    }
+    for (const channel of channels) {
+      const target = MIGU_LOCAL_REASSIGNMENTS[String(channel?.name || '').trim()]
+      if (target) append(target, [channel])
+    }
+  }
+  return output
 }
 
 /**
@@ -92,7 +169,8 @@ export function shouldFailRound(channelCount, failedCateCount) {
 export default {
   id: 'migu',
   name: '咪咕视频',
-  description: '央视 / 卫视 / 地方等 300+ 频道，含体育赛事与节目单。',
+  description: '央视 / 卫视 / 体育等 300+ 频道，含体育赛事与节目单。',
+  category: 'account',
 
   // 归属标识保持字面量 'migu'，不用注册表默认的 'xt:migu'（见文件头约束 2）
   sourceId: 'migu',
@@ -236,7 +314,8 @@ export default {
           })),
       }))
 
-    const deduped = dedupeAcrossGroups(groups)
+    const redistributed = redistributeMiguLocalChannels(groups)
+    const deduped = dedupeAcrossGroups(redistributed)
     const count = deduped.reduce((sum, g) => sum + g.dataList.length, 0)
 
     if (shouldFailRound(count, failed.length)) {

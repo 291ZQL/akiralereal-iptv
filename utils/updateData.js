@@ -4,6 +4,7 @@ import { appendFile, appendFileSync, copyFileSync, renameFileSync, writeFile, wr
 import { updatePlaybackData } from "./playback.js"
 import { aggregateExternalEpg } from "./epgAggregator.js"
 import { normalizeKey, logoMatchName } from "./channelNormalize.js"
+import { ensureLogoIndex, resolveLibraryLogo } from "./logoLibrary.js"
 import { renderOpts, needsOpts } from "./channelOpts.js"
 import { refreshToken as enableTokenRefresh, host, pass, enableMigu, externalLogoBase } from "../config.js"
 import refreshToken from "./refreshToken.js"
@@ -12,7 +13,8 @@ import { getDateString } from "./time.js"
 import { fetchUrl } from "./net.js"
 import { dataPath } from "./paths.js"
 import { readMiguTokenState, markMiguTokenRefreshed, MIGU_TOKEN_REFRESH_INTERVAL_MS } from "./miguTokenState.js"
-import { readFileSync, existsSync } from "node:fs"
+import { readFileSync, existsSync, statSync } from "node:fs"
+import { announcementM3uEntry, announcementTxtEntry } from "./announcement.js"
 
 const PE_CACHE_PATH = dataPath('pe-cache.json')
 
@@ -20,14 +22,27 @@ const PE_CACHE_PATH = dataPath('pe-cache.json')
 export const LOGO_EXTS = ['png', 'jpg', 'jpeg', 'webp']
 
 // 查找本地台标 data/logos/<频道名>.<ext>（用户在后台上传或手动放），命中返回可写入 m3u 的相对 URL，否则 ''
+// URL 尾部带 ?v=<文件修改时间>：电视端播放器按 URL 缓存台标（多数永不过期），同名换图后
+// 若 URL 一字不变，用户看到的永远是第一张（issue #119）。服务端路由按路径取文件、
+// 忽略 query，所以版本号只影响客户端缓存键。
 export function findLocalLogo(name) {
   if (!name) return ''
   for (const ext of LOGO_EXTS) {
-    if (existsSync(dataPath(`logos/${name}.${ext}`))) {
-      return `\${replace}/logos/${encodeURIComponent(name)}.${ext}`
+    const file = dataPath(`logos/${name}.${ext}`)
+    if (existsSync(file)) {
+      return `\${replace}/logos/${encodeURIComponent(name)}.${ext}${localLogoVersion(file)}`
     }
   }
   return ''
+}
+
+// 文件修改时间（毫秒整数）作为版本；读不到 stat（并发删除等）就退回无版本 URL，绝不让生成列表失败
+function localLogoVersion(file) {
+  try {
+    return `?v=${Math.floor(statSync(file).mtimeMs)}`
+  } catch {
+    return ''
+  }
 }
 
 /**
@@ -98,18 +113,17 @@ async function updateTV(hours, options = {}) {
   // 更新外部源（在获取数据之前）
   // regenerateOnly 模式下跳过外部源更新（因为这个模式用于配置变更后重新生成）
   if (!regenerateOnly) {
-    // 更新内置源（需要抓取的）
-    if (startupMode) {
-      printBlue("启动模式：检查需要更新的内置源...")
-      await updateBuiltInSources({ startupMode: true })
-    }
-    
+    // 需要网页抓取的内置源（纬来体育等）在启动模式下**不在这里抓**：抓一次要起 Chromium、
+    // 跑几个入口，内网抓不到时一轮十几分钟，而它排在最前面且串行，外部源、抓取模块、
+    // 生成播放列表全得等它（v4.6.1 用户日志：启动 836 秒里 823 秒在等它）。启动时先用缓存
+    // 出列表，抓取放到列表生成之后在后台跑，抓到再重新生成一次（见 app.js
+    // refreshBuiltInSourcesAfterStartup）。定时全量更新仍在下面的 else 分支里抓
     if (startupMode) {
       // 启动模式：只更新设置了 updateOnStartup: true 的源
       printBlue("启动模式：检查需要更新的外部源...")
       await updateExternalSources({ startupMode: true })
-      // 抓取模块启动时一律抓一轮：直播地址是短效的（B 站约 2 小时），
-      // 缓存里那份多半已经过期，不抓等于开机后一段时间全是死链。
+      // 抓取模块启动时一律抓一轮：直播平台的房间名单会变、部分模块的直链是短效的，
+      // 缓存里那份多半已经过时，不抓等于开机后一段时间全是死链。
       await updateExtractors({ forceAll: true })
     } else {
       // 定时更新模式：更新所有设置了自动刷新的源（包括内置源和外部源）
@@ -123,6 +137,9 @@ async function updateTV(hours, options = {}) {
   // regenerateOnly: 使用缓存的咪咕数据 + 最新的外部源数据
   let datas = await getAllChannels({ skipMigu, useCachedMigu: regenerateOnly })
   printGreen("电视频道-获取成功")
+
+  // 台标库索引（issue #124）：命中缓存时零网络开销，到期才下载一次；失败自动退回盲拼
+  await ensureLogoIndex()
 
   // 守卫一：声明了 critical 的抓取模块（咪咕）一条频道都没拿到。
   //
@@ -201,6 +218,10 @@ async function updateTV(hours, options = {}) {
     }
   }
   appendFileSync(interfacePath, `#EXTM3U x-tvg-url="\${replace}/playback.xml" catchup="append" catchup-source="?playbackbegin=\${(b)yyyyMMddHHmmss}&playbackend=\${(e)yyyyMMddHHmmss}"\n`)
+  // 项目自有公告频道固定写在原始播放列表首位。它仍会进入「我的频道」配置链，
+  // 因此用户可像普通频道一样隐藏、移动、重命名，不强塞给不需要的配置档。
+  appendFileSync(interfacePath, announcementM3uEntry())
+  appendFileSync(interfaceTXTPath, announcementTxtEntry())
   printYellow("开始更新电视频道...")
   
   // 回放数据：regenerateOnly模式下跳过playback更新
@@ -239,7 +260,7 @@ async function updateTV(hours, options = {}) {
       const isExtractor = channelItem.source === 'extractor'
       const isExternal = !isExtractor && (channelItem.source === 'external' || !!channelItem.url)
       // 台标优先级：本地 logos/<频道名>.<ext>（用户后台上传或手动放，最高、仅查本地不联网）
-      //   > 源自带台标（咪咕 pics / m3u 手写）> fanmingming 兜底（仅外部/内置）> 空。
+      //   > 源自带台标（咪咕 pics / m3u 手写）> 公共台标库兜底（仅外部/内置）> 空。
       // 取图用「台标匹配名」做 key（issue #40）：CCTV1高清（电信）→ CCTV1、湖南卫视（电信）→ 湖南卫视，
       // 让特殊命名的常见频道也能命中本地/公共库；频道显示名不变。本地查找仍以显示名优先、规范名兜底。
       const logoKey = logoMatchName(channelItem.name)
@@ -251,7 +272,15 @@ async function updateTV(hours, options = {}) {
         logoUrl = channelItem.pics?.highResolutionH || channelItem.logo || ""
       }
       if (!logoUrl && (isExternal || isBuiltIn || isExtractor) && externalLogoBase) {
-        logoUrl = `${externalLogoBase}${encodeURIComponent(logoKey || channelItem.name)}.png`
+        // 有索引就只写库里真实存在的图（issue #124）：查不到写空串，让播放器出自己的占位图，
+        // 而不是一个必定 404 的地址（裂图）。景观/慢直播这类「频道名不是台名」的伪频道
+        // 天然查不到，正好自动留空。索引不可用时（首次没网/库改版）退回按名盲拼的老行为。
+        const libraryName = resolveLibraryLogo(channelItem.name, datas[i].name)
+        if (libraryName === null) {
+          logoUrl = `${externalLogoBase}${encodeURIComponent(logoKey || channelItem.name)}.png`
+        } else if (libraryName) {
+          logoUrl = `${externalLogoBase}${encodeURIComponent(libraryName)}.png`
+        }
       }
       
       // 内置源使用playURL字段，外部源与抓取模块使用url字段，咪咕源构造URL
@@ -263,7 +292,14 @@ async function updateTV(hours, options = {}) {
         // ref 必须是单个路径段——playlistConfig.buildChannelId 用
         // /^\$\{replace\}\/([^/?#]+)/ 取频道主键，多段会失配、让老用户的
         // 「我的频道」隐藏/重命名/归类/排序全部作废。
-        playUrl = `\${replace}/${channelItem.deferredRef}`
+        // 某些官方 CDN 在服务端可访问，但会被电视/浏览器的网络层直接拦截。
+        // 模块可声明 proxyHls（清单+分片全代理）或 relayHls（只代理清单）。
+        // 后者适合需要持续换签/切 CDN、但分片可由播放器直连的平台。
+        playUrl = channelItem.proxyHls === true
+          ? `\${replace}/proxy/${channelItem.deferredRef}.m3u8`
+          : channelItem.relayHls === true
+            ? `\${replace}/relay/${channelItem.deferredRef}.m3u8`
+            : `\${replace}/${channelItem.deferredRef}`
       } else if (isExternal || isExtractor) {
         playUrl = channelItem.url      // 外部源 / 抓取模块使用url
       } else {
@@ -313,7 +349,8 @@ async function updateTV(hours, options = {}) {
       const optLines = renderOpts(channelItem.opts)
 
       // 写入节目
-      appendFileSync(interfacePath, `#EXTINF:-1 tvg-id="${channelItem.name}" tvg-name="${channelItem.name}" tvg-logo="${logoUrl}"${sourceAttr} group-title="${datas[i].name}",${channelItem.name}\n${optLines}${playUrl}\n`)
+      const catchupAttr = channelItem.catchup === 'none' ? ' catchup="none"' : ''
+      appendFileSync(interfacePath, `#EXTINF:-1 tvg-id="${channelItem.name}" tvg-name="${channelItem.name}" tvg-logo="${logoUrl}"${sourceAttr}${catchupAttr} group-title="${datas[i].name}",${channelItem.name}\n${optLines}${playUrl}\n`)
       // txt：diyp/TVBox 格式只有「频道名,地址」两列，放不下请求头，依赖请求头的
       // 频道写进去必定 403——缺一个台好过一个死台，整条跳过。
       // 判据用 needsOpts 而不是「optLines 是否为空」：只带 network-caching 的频道
