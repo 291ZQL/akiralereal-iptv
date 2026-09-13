@@ -3070,6 +3070,14 @@
         }
         .confirm-title, .modal-content h3 { color: var(--ui-text); }
         .confirm-message { color: var(--ui-text-secondary); }
+        /* 确认框的文案里有换行（如「屏蔽规则会命中这些频道：…」逐行列出）。
+           默认 white-space 会把 \n 折叠成空格，多行提示挤成一坨；长清单还会把按钮顶出可视区。 */
+        .confirm-message { white-space: pre-line; max-height: 46vh; overflow-y: auto; }
+        /* 多选一对话框的按钮文案比「确定 / 取消」长得多（「连同 2 个一起隐藏」）。
+           默认 .confirm-buttons 是不换行的 flex 行，三个按钮会被挤到文字折行。 */
+        #groupChoiceOverlay .confirm-dialog { max-width: 560px; }
+        #groupChoiceOverlay .confirm-buttons { flex-wrap: wrap; }
+        #groupChoiceOverlay .confirm-btn { flex: 0 0 auto; white-space: nowrap; }
         .confirm-btn-confirm { background: var(--ui-danger); border-color: var(--ui-danger); }
         .confirm-btn-confirm:hover { background: #a92b38; border-color: #a92b38; }
         .reset-option { padding: 12px 13px; border-color: var(--ui-line); border-radius: 11px; }
@@ -3230,6 +3238,15 @@
     </style>
 </head>
 <body>
+    <!-- 多选一对话框：隐藏 / 恢复分组时要在「只这一个」和「这一整批」之间选，是非两态不够用 -->
+    <div class="confirm-overlay" id="groupChoiceOverlay">
+        <div class="confirm-dialog">
+            <div class="confirm-title" id="groupChoiceTitle"></div>
+            <div class="confirm-message" id="groupChoiceMessage"></div>
+            <div class="confirm-buttons" id="groupChoiceButtons"></div>
+        </div>
+    </div>
+
     <!-- 自定义确认对话框 -->
     <div class="confirm-overlay" id="confirmOverlay">
         <div class="confirm-dialog">
@@ -3258,8 +3275,15 @@
                 <label class="reset-option">
                     <input type="checkbox" id="resetHidden" checked>
                     <div class="reset-option-info">
-                        <strong>隐藏的分组和频道</strong>
-                        <span>显示所有被隐藏的分组和频道</span>
+                        <strong>逐条隐藏的分组和频道</strong>
+                        <span>恢复用「隐藏」按钮逐条隐藏的分组和频道</span>
+                    </div>
+                </label>
+                <label class="reset-option">
+                    <input type="checkbox" id="resetRules" checked>
+                    <div class="reset-option-info">
+                        <strong>屏蔽规则</strong>
+                        <span>清空按名字长期屏蔽的规则，被规则挡掉的频道重新出现</span>
                     </div>
                 </label>
                 <label class="reset-option">
@@ -3273,6 +3297,49 @@
             <div class="modal-actions" style="margin-top: 20px;">
                 <button class="btn" onclick="closeResetModal()">取消</button>
                 <button class="btn btn-warning" onclick="executeReset()">确定重置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 按名字屏蔽频道的规则弹窗（issue #123） -->
+    <div class="modal" id="hiddenRuleModal">
+        <div class="modal-content" style="width: 620px; max-width: 92%;">
+            <h3>🚫 屏蔽规则 <span style="font-size:13px;font-weight:normal;color:#888;">当前档：<span id="hiddenRuleProfileLabel">默认</span></span></h3>
+            <p style="color: #666; font-size: 13px; margin-bottom: 4px;">
+                按<strong>名字</strong>屏蔽，命中的频道不会进播放列表。和逐条「隐藏」的区别：隐藏绑的是频道 ID，
+                源换个地址 ID 就变、那条隐藏会失效；规则只看名字，<strong>源换址、频道每天重建都照样生效</strong>。
+            </p>
+            <p style="color: #999; font-size: 12px; margin-bottom: 14px;">只影响当前配置档，删掉规则即恢复。</p>
+
+            <div id="hiddenRuleList" style="max-height: 320px; overflow-y: auto; margin-bottom: 14px;"></div>
+
+            <div style="border-top: 1px solid #eee; padding-top: 14px;">
+                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                    <input type="text" id="hiddenRuleValue" placeholder="频道名或关键字，例如：购物" oninput="previewHiddenRule()" style="flex: 1; min-width: 200px; padding: 7px 10px; border: 1px solid #ddd; border-radius: 4px;">
+                    <select id="hiddenRuleMode" onchange="previewHiddenRule()" style="padding: 7px 10px; border: 1px solid #ddd; border-radius: 4px;">
+                        <option value="contains">名字包含</option>
+                        <option value="exact">整名相同</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="addHiddenRule()">添加</button>
+                </div>
+                <div id="hiddenRulePreview" style="font-size: 12px; color: #888; margin-top: 8px; min-height: 18px;"></div>
+            </div>
+
+            <div class="modal-actions" style="margin-top: 18px;">
+                <button class="btn" onclick="closeHiddenRuleModal()">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 缺台标的频道清单（issue #124） -->
+    <div class="modal" id="missingLogoModal">
+        <div class="modal-content" style="width: 560px; max-width: 92%;">
+            <h3>🖼 缺台标的频道 <span style="font-size:13px;font-weight:normal;color:#888;">共 <span id="missingLogoCount">0</span> 个</span></h3>
+            <p style="color:#666;font-size:13px;margin-bottom:4px;">公共台标库里没有这些台的图，订阅里留了空、播放器会画自己的占位图。想补的话两种办法：</p>
+            <p style="color:#999;font-size:12px;margin-bottom:12px;">① 点「补台标」进频道详情上传；② 直接把 <code>&lt;频道名&gt;.png</code> 放进数据目录的 <code>logos/</code>。景观 / 慢直播这类本来就不是台名的，留空即可。</p>
+            <div id="missingLogoList" style="max-height:380px;overflow-y:auto;"></div>
+            <div class="modal-actions" style="margin-top:16px;">
+                <button class="btn" onclick="closeMissingLogoModal()">关闭</button>
             </div>
         </div>
     </div>
@@ -3500,6 +3567,8 @@
                     <div class="my-playlist-actions" style="flex-wrap: wrap; align-items: center;">
                         <span style="font-size: 14px; color: #333;">当前档：<strong id="currentProfileLabel">默认</strong></span>
                         <button class="btn btn-primary" onclick="openProfileModal()" title="管理多套配置档：切换 / 新建 / 改名 / 删除 / 重置">✏️ 编辑</button>
+                        <button class="btn" onclick="openHiddenRuleModal()" title="按名字长期屏蔽频道：源换地址、频道每天重建都照样生效">🚫 屏蔽规则</button>
+                        <button class="btn" onclick="openMissingLogoModal()" title="列出当前档里没有台标的频道，点进去就能上传">🖼 缺台标</button>
                     </div>
                 </div>
                 <div class="subscribe-bar" id="subscribeBar"></div>
@@ -3857,7 +3926,7 @@
                                 <strong style="color: #333; font-size: 16px;">当前版本</strong>
                             </div>
                             <div style="padding-left: 30px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-                                <span id="versionText" style="font-size: 15px; color: #333; font-weight: 600;">v4.13.0</span>
+                                <span id="versionText" style="font-size: 15px; color: #333; font-weight: 600;">v4.15.0</span>
                                 <button class="btn btn-sm" onclick="checkUpdate()" id="checkUpdateBtn">检查更新</button>
                             </div>
                             <div id="updateInfo" style="padding-left: 30px; margin-top: 8px; font-size: 13px; display: none;"></div>
@@ -5023,11 +5092,26 @@
                 if (payload && payload.success && payload.data) {
                     epgConfig = payload.data;
                     if (!Array.isArray(epgConfig.sources)) epgConfig.sources = [];
+                    // 只有 GET 会带 legacyUrls；增删改的响应不带，沿用上次的清单（它不会变）
+                    if (Array.isArray(payload.legacyUrls)) epgLegacyUrls = payload.legacyUrls;
+                    if (typeof payload.defaultUrl === 'string') epgDefaultUrl = payload.defaultUrl;
                     renderEpgSources();
                 }
             } catch (e) {
                 console.error('加载 EPG 源失败', e);
             }
+        }
+
+        // 已废掉的老默认源地址（GET /api/epg-sources 下发）。自动迁移只碰「一字未改」的内置默认源，
+        // 改过名的那条会停在死源上：它现在只回 101 个央视卫视，而这些频道咪咕本来就有节目单，
+        // 所以它实际几乎什么都没补到——但源列表里只是一个偏低的「已匹配」数字，看不出问题。issue #124
+        let epgLegacyUrls = [];
+        let epgDefaultUrl = '';
+        function epgLegacyHint(s) {
+            if (!s || !epgLegacyUrls.includes(String(s.url || '').trim())) return '';
+            const suggest = epgDefaultUrl ? `建议把地址改成 <code>${escapeHtml(epgDefaultUrl)}</code>，或` : '建议';
+            return `<div style="margin-top:4px;font-size:12px;color:#d46b08;">⚠ 这个地址已经废了：现在只剩央视和卫视（咪咕本来就有），地方台一个都补不到。`
+                + `${suggest}删掉这条、让程序重建默认源。</div>`;
         }
 
         function epgStatusHtml(s) {
@@ -5036,7 +5120,8 @@
             else if (typeof s.lastStatus === 'string' && s.lastStatus.indexOf('失败') >= 0) { color = '#ff4d4f'; text = s.lastStatus; }
             const when = s.lastUpdated ? new Date(s.lastUpdated).toLocaleString() : '从未';
             return `<span style="color:${color};">● ${escapeHtml(text)}</span>` +
-                `<span style="color:#888;"> · 频道 ${s.channelCount || 0} · 已匹配 ${s.matchedCount || 0} · 上次 ${escapeHtml(when)}</span>`;
+                `<span style="color:#888;"> · 频道 ${s.channelCount || 0} · 已匹配 ${s.matchedCount || 0} · 上次 ${escapeHtml(when)}</span>` +
+                epgLegacyHint(s);
         }
 
         function renderEpgSources() {
@@ -5404,6 +5489,266 @@
             const r = await groupRulesPost({ action: 'removeRule', group });
             if (r.success) { groupRulesData = r.data; renderGroupRules(); showStatus('已删除', 'success'); }
             else showStatus(r.message || '删除失败', 'error');
+        }
+
+        // ========== 按名字屏蔽频道的规则（issue #123） ==========
+        // 与「隐藏」的分工：隐藏绑 `原始分组::频道ID`，而频道 ID 里含播放地址——上游换个路径就换 ID，
+        // 那条隐藏静默失效、频道自己冒回分组；每天重建的赛事 / 事件直播更是压根没有稳定 ID。
+        // 规则只看名字，两种情况都盖得住。规则存在配置档里（每档独立），判定在服务端 applyConfig。
+        //
+        // 这一整块只新增、不改动任何既有的 hiddenChannels 读写路径——那些路径漏改一处
+        // 就会变成「隐藏了取消不掉」，比功能缺失更糟。逃生舱也因此没有塞进「已隐藏」列表，
+        // 而是让每条规则自己显示命中了哪些频道，用户在加规则前就能看到误伤面。
+
+        // 下面两个函数必须与服务端 utils/hiddenRules.js 的语义逐字一致，否则界面预览的命中数
+        // 和实际生效的结果对不上。空 value 永不命中是硬底线：'' 会让 includes('') 恒为真，
+        // 一条空规则将清空整份播放列表。
+        function normalizeHiddenRulesClient(rules) {
+            if (!Array.isArray(rules)) return [];
+            const seen = new Set();
+            const out = [];
+            for (const rule of rules) {
+                const raw = typeof rule === 'string' ? { value: rule } : rule;
+                if (!raw || typeof raw !== 'object') continue;
+                const value = typeof raw.value === 'string' ? raw.value.trim() : '';
+                if (!value) continue;
+                const mode = raw.mode === 'exact' ? 'exact' : 'contains';
+                const key = mode + '\n' + value.toLowerCase();
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push({ value, mode });
+            }
+            return out;
+        }
+
+        function hiddenRuleHits(rule, names) {
+            const value = typeof rule?.value === 'string' ? rule.value.trim().toLowerCase() : '';
+            if (!value) return false;
+            return (Array.isArray(names) ? names : [names])
+                .filter(n => typeof n === 'string' && n.trim())
+                .map(n => n.trim().toLowerCase())
+                .some(n => rule.mode === 'exact' ? n === value : n.includes(value));
+        }
+
+        function hiddenRulesOf() { return normalizeHiddenRulesClient(myPlaylistConfig.hiddenRules); }
+
+        // 某条规则会屏蔽掉哪些频道。按「原始全集」算，且与服务端一样同时认原始名和重命名后的显示名。
+        function channelsMatchedByHiddenRule(rule) {
+            const out = [];
+            for (const group of (myPlaylistOriginalData || [])) {
+                for (const ch of (group.channels || [])) {
+                    const renamed = myPlaylistConfig.channelRenameMap?.[`${group.name}::${ch.id}`];
+                    if (hiddenRuleHits(rule, [ch.name, renamed])) out.push({ group: group.name, name: renamed || ch.name });
+                }
+            }
+            return out;
+        }
+
+        function openHiddenRuleModal() {
+            document.getElementById('hiddenRuleProfileLabel').textContent =
+                (profileList.find(p => p.id === activeProfile) || {}).name || '默认';
+            document.getElementById('hiddenRuleValue').value = '';
+            document.getElementById('hiddenRulePreview').textContent = '';
+            renderHiddenRules();
+            document.getElementById('hiddenRuleModal').style.display = 'block';
+        }
+
+        function closeHiddenRuleModal() {
+            document.getElementById('hiddenRuleModal').style.display = 'none';
+        }
+
+        function renderHiddenRules() {
+            const box = document.getElementById('hiddenRuleList');
+            if (!box) return;
+            const rules = hiddenRulesOf();
+            if (!rules.length) {
+                box.innerHTML = '<div class="system-config-hint" style="margin:0;">还没有规则。可以在这里添加，也可以在频道列表里点某个频道的「屏蔽」按钮一键生成。</div>';
+                return;
+            }
+            box.innerHTML = rules.map((r, i) => {
+                const hits = channelsMatchedByHiddenRule(r);
+                const label = r.mode === 'exact' ? '整名相同' : '名字包含';
+                // 命中清单直接摊开给用户看——这是误伤的唯一可见入口
+                const list = hits.length
+                    ? `<div style="font-size:12px;color:#666;margin-top:6px;word-break:break-all;">${hits.slice(0, 12).map(h => `${escapeHtml(h.group)} · ${escapeHtml(h.name)}`).join('　|　')}${hits.length > 12 ? `　…另 ${hits.length - 12} 个` : ''}</div>`
+                    : '<div style="font-size:12px;color:#bbb;margin-top:6px;">当前没有频道命中（源里暂时没有这个名字，规则仍然有效）</div>';
+                return `<div style="border:1px solid #eee;border-radius:6px;padding:10px;margin-bottom:8px;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                        <div style="min-width:0;">
+                            <span style="color:#bbb;font-size:12px;margin-right:6px;">${i + 1}.</span>
+                            <strong style="word-break:break-all;">${escapeHtml(r.value)}</strong>
+                            <span style="font-size:12px;color:#888;margin-left:6px;">${label}</span>
+                            <span style="font-size:12px;color:${hits.length ? '#fa8c16' : '#bbb'};margin-left:6px;">屏蔽 ${hits.length} 个</span>
+                        </div>
+                        <button class="btn btn-sm btn-danger" style="flex-shrink:0;" onclick="removeHiddenRule(${i})">删除</button>
+                    </div>
+                    ${list}
+                </div>`;
+            }).join('');
+        }
+
+        // 整份 POST 前必须确认配置已从服务端加载成功，否则会把默认空骨架存上去、清掉该档全部自定义
+        async function saveHiddenRules(rules, okMessage) {
+            if (!myPlaylistConfigLoaded) {
+                await loadMyPlaylistConfig();
+                if (!myPlaylistConfigLoaded) {
+                    showStatus('当前档配置未加载成功，请刷新页面后重试', 'error');
+                    return false;
+                }
+            }
+            const before = myPlaylistConfig.hiddenRules;
+            myPlaylistConfig.hiddenRules = rules;
+            try {
+                const response = await fetch(mpConfigUrl(), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(myPlaylistConfig)
+                });
+                const result = await response.json();
+                if (!result.success) {
+                    myPlaylistConfig.hiddenRules = before;   // 存失败就回滚内存，别让界面显示一个没落盘的状态
+                    showStatus(result.message || '保存失败', 'error');
+                    return false;
+                }
+                await loadMyPlaylist(false);
+                renderHiddenRules();
+                showStatus(okMessage, 'success');
+                return true;
+            } catch (error) {
+                myPlaylistConfig.hiddenRules = before;
+                showStatus('保存失败: ' + error.message, 'error');
+                return false;
+            }
+        }
+
+        // 边打字边报命中数：「名字包含」很容易一刀切掉一大片，让误伤面在按「添加」之前就可见。
+        function previewHiddenRule() {
+            const box = document.getElementById('hiddenRulePreview');
+            if (!box) return;
+            const value = (document.getElementById('hiddenRuleValue').value || '').trim();
+            const mode = document.getElementById('hiddenRuleMode').value === 'exact' ? 'exact' : 'contains';
+            if (!value) { box.textContent = ''; return; }
+            const hits = channelsMatchedByHiddenRule({ value, mode });
+            if (!hits.length) {
+                box.style.color = '#999';
+                box.textContent = '当前没有频道命中（规则仍可保存，以后出现同名频道会被挡掉）';
+                return;
+            }
+            box.style.color = hits.length > 20 ? '#cf1322' : '#fa8c16';
+            box.textContent = `将屏蔽 ${hits.length} 个频道：` + hits.slice(0, 6).map(h => `${h.group} · ${h.name}`).join('，')
+                + (hits.length > 6 ? ` …另 ${hits.length - 6} 个` : '');
+        }
+
+        async function addHiddenRule() {
+            const input = document.getElementById('hiddenRuleValue');
+            const value = (input.value || '').trim();
+            const mode = document.getElementById('hiddenRuleMode').value === 'exact' ? 'exact' : 'contains';
+            if (!value) { showStatus('请先填写要屏蔽的名字或关键字', 'error'); return; }
+
+            const rules = hiddenRulesOf();
+            if (rules.some(r => r.mode === mode && r.value.toLowerCase() === value.toLowerCase())) {
+                showStatus('这条规则已经有了', 'info');
+                return;
+            }
+            // 先把误伤面摆出来再让用户确认——「名字包含」很容易一刀切掉一大片
+            const hits = channelsMatchedByHiddenRule({ value, mode });
+            const preview = hits.length
+                ? `将屏蔽 ${hits.length} 个频道：\n${hits.slice(0, 15).map(h => `${h.group} · ${h.name}`).join('\n')}${hits.length > 15 ? `\n…另 ${hits.length - 15} 个` : ''}`
+                : '当前没有频道命中这条规则（源里暂时没有这个名字）。规则仍会保存，以后出现同名频道会被挡掉。';
+            const confirmed = await showConfirm(`${preview}\n\n确定添加吗？`, '添加屏蔽规则');
+            if (!confirmed) return;
+
+            if (await saveHiddenRules([...rules, { value, mode }], `已添加规则，屏蔽 ${hits.length} 个频道`)) {
+                input.value = '';
+                document.getElementById('hiddenRulePreview').textContent = '';
+            }
+        }
+
+        async function removeHiddenRule(index) {
+            const rules = hiddenRulesOf();
+            const rule = rules[index];
+            if (!rule) return;
+            const confirmed = await showConfirm(`删除规则「${rule.value}」后，被它屏蔽的频道会重新出现。确定吗？`, '删除屏蔽规则');
+            if (!confirmed) return;
+            await saveHiddenRules(rules.filter((_, i) => i !== index), '已删除规则');
+        }
+
+        // 频道列表里的「屏蔽」按钮：按该频道的**原始名**生成一条整名规则。
+        // 用原始名而不是重命名后的显示名——显示名会随用户取消重命名而消失，规则就跟着落空；
+        // 原始名跟着源走，稳。服务端两边都认，所以功能上等价。
+        async function blockChannelByName(channelId) {
+            const group = myPlaylistData[selectedGroupIndex];
+            const channel = group?.channels.find(c => c.id === channelId);
+            if (!channel) return;
+            const originalGroupName = channelOriginalGroupName(channel, group.name);
+            const original = (myPlaylistOriginalData || [])
+                .find(g => g.name === originalGroupName)?.channels.find(c => c.id === channelId);
+            const value = original?.name || channel.name;
+            if (!value) { showStatus('这个频道没有名字，无法按名字屏蔽', 'error'); return; }
+
+            const rules = hiddenRulesOf();
+            if (rules.some(r => r.mode === 'exact' && r.value.toLowerCase() === value.toLowerCase())) {
+                showStatus('这个频道名已经在屏蔽规则里了', 'info');
+                return;
+            }
+            const hits = channelsMatchedByHiddenRule({ value, mode: 'exact' });
+            const renamedNote = original && original.name !== channel.name
+                ? `\n（按源里的原始名「${value}」屏蔽，改名前后都算数）`
+                : '';
+            const others = hits.length > 1
+                ? `\n\n同名的还有 ${hits.length - 1} 个，会一起屏蔽：\n${hits.map(h => `${h.group} · ${h.name}`).join('\n')}`
+                : '';
+            const confirmed = await showConfirm(
+                `以后叫「${value}」的频道都不再出现，源换地址、频道重建也一样。${renamedNote}${others}\n\n确定屏蔽吗？`,
+                '永久屏蔽此频道名'
+            );
+            if (!confirmed) return;
+            await saveHiddenRules([...rules, { value, mode: 'exact' }], `已屏蔽「${value}」`);
+        }
+
+        // ========== 缺台标的频道（issue #124） ==========
+        // 台标改成按库索引取图后，库里没有的一律留空（播放器画占位图，不再裂图）。剩下没图的
+        // 可以自己往数据目录 logos/ 放一张 <频道名>.png，或在频道详情里上传——但先得知道是哪些。
+        // 逐频道的状态点能看出来，可几十个要靠肉眼扫。这里给一张工单式清单，点进去就是上传入口。
+        // 只新增，不碰任何现有渲染；按当前档的**可见**频道算，隐藏掉的没必要补。
+        function channelsMissingLogo() {
+            const out = [];
+            for (const g of (myPlaylistData || [])) {
+                if (isSystemAnnouncementGroup(g)) continue;
+                for (const ch of (g.channels || [])) {
+                    if (!ch.logo) out.push({ group: g.name, id: ch.id, name: ch.name });
+                }
+            }
+            return out;
+        }
+
+        function openMissingLogoModal() {
+            const list = channelsMissingLogo();
+            document.getElementById('missingLogoCount').textContent = String(list.length);
+            const box = document.getElementById('missingLogoList');
+            if (!list.length) {
+                box.innerHTML = '<div class="system-config-hint" style="margin:0;">当前档里所有可见频道都有台标 🎉</div>';
+            } else {
+                const byGroup = new Map();
+                for (const it of list) {
+                    if (!byGroup.has(it.group)) byGroup.set(it.group, []);
+                    byGroup.get(it.group).push(it);
+                }
+                box.innerHTML = [...byGroup.entries()].map(([g, items]) => `
+                    <div style="margin-bottom:10px;">
+                        <div style="font-size:12px;color:#888;margin-bottom:4px;">${escapeHtml(g)} · ${items.length}</div>
+                        ${items.map(it => `
+                        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border:1px solid #eee;border-radius:5px;margin-bottom:4px;">
+                            <span style="min-width:0;word-break:break-all;">${escapeHtml(it.name)}</span>
+                            <button class="btn btn-sm" style="flex-shrink:0;" onclick="closeMissingLogoModal(); showChannelDetail('${String(it.id).replace(/'/g, "\\'")}', false)">补台标</button>
+                        </div>`).join('')}
+                    </div>`).join('');
+            }
+            document.getElementById('missingLogoModal').style.display = 'block';
+        }
+
+        function closeMissingLogoModal() {
+            document.getElementById('missingLogoModal').style.display = 'none';
         }
 
         // 在「频道详情」里直接给本频道设别名（issue #62）：把本频道名追加到指定规范名下（不覆盖已有别名），
@@ -6524,6 +6869,25 @@
             });
         }
 
+        // 多选一对话框。showConfirm 是二态的，而「隐藏这个分组」还是「连同同前缀的一整批」
+        // 属于三态：把「只这一个」塞进「取消」是最糟的做法——用户按取消是想中止，不是想执行另一半。
+        let groupChoiceResolve = null;
+        function showGroupChoice(title, message, options) {
+            return new Promise(resolve => {
+                document.getElementById('groupChoiceTitle').textContent = title;
+                document.getElementById('groupChoiceMessage').textContent = message;
+                document.getElementById('groupChoiceButtons').innerHTML =
+                    '<button class="confirm-btn confirm-btn-cancel" onclick="hideGroupChoice(null)">取消</button>' +
+                    options.map(o => `<button class="confirm-btn ${o.primary ? 'confirm-btn-confirm' : 'confirm-btn-cancel'}" onclick="hideGroupChoice('${o.key}')">${escapeHtml(o.label)}</button>`).join('');
+                document.getElementById('groupChoiceOverlay').classList.add('show');
+                groupChoiceResolve = resolve;
+            });
+        }
+        function hideGroupChoice(key) {
+            document.getElementById('groupChoiceOverlay').classList.remove('show');
+            if (groupChoiceResolve) { groupChoiceResolve(key); groupChoiceResolve = null; }
+        }
+
         function hideConfirm(result) {
             document.getElementById('confirmOverlay').classList.remove('show');
             if (confirmCallback) {
@@ -7566,7 +7930,8 @@ if(success){
             groupOrder: [],
             deletedGroups: [],
             groupRenameMap: {},
-            groupSortMode: {}
+            groupSortMode: {},
+            hiddenRules: []   // 按名字长期屏蔽（issue #123）：[{value, mode:'exact'|'contains'}]
         };
         // 多套 m3u 配置档：当前编辑/查看的档 + 档列表（default 恒在首位）
         let activeProfile = 'default';
@@ -7604,6 +7969,75 @@ if(success){
         }
         function mpListUrl() { return API_PREFIX + '/api/' + 'my-playlist' + profileQuery(); }
         function mpConfigUrl() { return API_PREFIX + '/api/' + 'my-playlist-config' + profileQuery(); }
+
+        // ========== 「已隐藏」区的单一事实来源 ==========
+        // 这份列表原先在六个地方各算一遍，且有三种不同实现：一半支持 deletedGroups 的通配符
+        // 前缀（`体育-*`），另一半只做精确匹配。六处又共用同一个 selectedGroupIndex——
+        // 配置里一旦有通配符，各自算出的列表长度就不一样，「恢复整组」「全选」会操作到**别的分组**。
+        // 以前界面写不出通配符所以没人踩到；现在「隐藏分组」能生成通配符了，必须先收口。
+
+        /** 分组是否被 deletedGroups 隐藏（支持 `前缀*`）。与服务端 isGroupDeleted 同语义。 */
+        function isGroupHiddenByConfig(groupName) {
+            if (groupName === '公告') return false;   // 公告组不可删除，protectAnnouncementConfig 也会兜底
+            return (myPlaylistConfig.deletedGroups || []).some(pattern =>
+                pattern.endsWith('*') ? groupName.startsWith(pattern.slice(0, -1)) : pattern === groupName
+            );
+        }
+
+        /** 命中该分组的那条 deletedGroups 条目（用于区分「精确隐藏」还是「被通配规则盖住」）。 */
+        function groupHiddenByPattern(groupName) {
+            return (myPlaylistConfig.deletedGroups || []).find(pattern =>
+                pattern.endsWith('*') ? groupName.startsWith(pattern.slice(0, -1)) : pattern === groupName
+            ) || null;
+        }
+
+        /** 某条通配规则当前盖住了哪些分组名。 */
+        function groupsCoveredByPattern(pattern) {
+            if (!pattern || !pattern.endsWith('*')) return pattern ? [pattern] : [];
+            const prefix = pattern.slice(0, -1);
+            return (myPlaylistOriginalData || [])
+                .filter(g => g.name !== '公告' && g.name.startsWith(prefix))
+                .map(g => g.name);
+        }
+
+        /** 频道是否被逐条隐藏。key 必须带原始分组名——裸 ch.id 匹配不到任何东西（旧 bug）。 */
+        function isChannelHiddenById(groupName, channel) {
+            return (myPlaylistConfig.hiddenChannels || []).includes(`${groupName}::${channel.id}`);
+        }
+
+        // 分组名里的分隔符：跨过它的前缀才算「一类分组」，免得把「央视」切成「央」这种荒唐前缀。
+        const GROUP_NAME_SEPARATORS = ['-', '_', '·', '/', '|', '｜', '—', ' '];
+
+        /**
+         * 找出与该分组共享「分隔符边界前缀」的其它分组：体育-昨天 → 前缀「体育-」，兄弟为 体育-今天 / 体育-明天。
+         * 从最长的前缀往短里试，取第一个有兄弟的——前缀越长越具体，误伤越小
+         * （体育-回放-昨天 优先归到「体育-回放-」而不是「体育-」）。名字里没有分隔符则不提议。
+         */
+        function groupPrefixSiblings(groupName) {
+            const others = (myPlaylistOriginalData || [])
+                .map(g => g.name)
+                .filter(name => name !== '公告' && name !== groupName && !isGroupHiddenByConfig(name));
+            for (let i = groupName.length - 1; i > 0; i--) {
+                if (!GROUP_NAME_SEPARATORS.includes(groupName[i])) continue;
+                const prefix = groupName.slice(0, i + 1);
+                const names = others.filter(name => name.startsWith(prefix));
+                if (names.length > 0) return { prefix, names };
+            }
+            return null;
+        }
+
+        /** 「已隐藏」区的完整列表：整组隐藏的在前，含隐藏频道的分组在后。所有调用点必须用这一份。 */
+        function hiddenAreaGroups() {
+            const wholeGroups = (myPlaylistOriginalData || []).filter(g =>
+                !isSystemAnnouncementGroup(g) && isGroupHiddenByConfig(g.name)
+            );
+            const partialGroups = (myPlaylistOriginalData || []).map(g => {
+                if (isGroupHiddenByConfig(g.name)) return null;   // 整组已隐藏，不再重复列频道
+                const channels = g.channels.filter(ch => isChannelHiddenById(g.name, ch));
+                return channels.length > 0 ? { ...g, channels, isPartialDelete: true } : null;
+            }).filter(Boolean);
+            return [...wholeGroups, ...partialGroups];
+        }
 
         function escapeHtml(s) {
             return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -7997,53 +8431,7 @@ if(success){
             const deletedList = document.getElementById('deletedGroupList');
             if (!deletedList) return;
 
-            console.log('myPlaylistOriginalData:', myPlaylistOriginalData.length, 'groups');
-            console.log('deletedGroups:', myPlaylistConfig.deletedGroups);
-            console.log('hiddenChannels:', myPlaylistConfig.hiddenChannels);
-
-            // 从原始数据中找出被删除的分组（支持通配符前缀匹配）
-            const deletedGroups = myPlaylistOriginalData.filter(group => {
-                if (isSystemAnnouncementGroup(group)) return false;
-                return myPlaylistConfig.deletedGroups.some(pattern => {
-                    if (pattern.endsWith('*')) {
-                        return group.name.startsWith(pattern.slice(0, -1));
-                    }
-                    return pattern === group.name;
-                });
-            });
-
-            console.log('找到被删除的分组:', deletedGroups.length);
-
-            // 检查分组是否被通配符或精确匹配删除（供后面使用）
-            function isGroupDeletedByConfig(groupName) {
-                if (groupName === '公告') return false;
-                return myPlaylistConfig.deletedGroups.some(pattern => {
-                    if (pattern.endsWith('*')) {
-                        return groupName.startsWith(pattern.slice(0, -1));
-                    }
-                    return pattern === groupName;
-                });
-            }
-
-            // 从原始数据中找出被隐藏的频道（按原始分组显示）
-            const groupsWithHiddenChannels = myPlaylistOriginalData.map(group => {
-                const hiddenChannels = group.channels.filter(ch => 
-                    myPlaylistConfig.hiddenChannels.includes(`${group.name}::${ch.id}`) &&
-                    !isGroupDeletedByConfig(group.name)
-                );
-                if (hiddenChannels.length > 0) {
-                    console.log(`分组 "${group.name}" 有 ${hiddenChannels.length} 个隐藏频道:`, hiddenChannels.map(ch => ch.name));
-                }
-                return hiddenChannels.length > 0 ? {
-                    ...group,
-                    channels: hiddenChannels,
-                    isPartialDelete: true
-                } : null;
-            }).filter(g => g !== null);
-
-            console.log('找到包含隐藏频道的分组:', groupsWithHiddenChannels.length);
-
-            const allDeletedGroups = [...deletedGroups, ...groupsWithHiddenChannels];
+            const allDeletedGroups = hiddenAreaGroups();
 
             // 如果正在查看已隐藏区域，调整selectedGroupIndex到有效范围
             if (isViewingDeleted && allDeletedGroups.length > 0) {
@@ -8055,13 +8443,20 @@ if(success){
             if (allDeletedGroups.length === 0) {
                 deletedList.innerHTML = '<div style="text-align: center; padding: 20px; color: #999; font-size: 12px;">无隐藏内容</div>';
             } else {
-                deletedList.innerHTML = allDeletedGroups.map((group, index) => `
-                    <div class="my-playlist-group-item deleted ${isViewingDeleted && selectedGroupIndex === index ? 'active' : ''}" 
+                deletedList.innerHTML = allDeletedGroups.map((group, index) => {
+                    // 被通配规则盖住的分组标出来源，否则用户看到一个自己没手动隐藏过的分组
+                    // 出现在这里，完全无从判断是谁干的（新装的源冒出同前缀分组时尤其如此）。
+                    const pattern = group.isPartialDelete ? null : groupHiddenByPattern(group.name);
+                    const badge = pattern && pattern.endsWith('*')
+                        ? `<span title="被规则 ${escapeHtml(pattern)} 自动隐藏" style="font-size:11px;color:#fa8c16;border:1px solid #ffd591;border-radius:3px;padding:0 3px;margin-left:5px;">${escapeHtml(pattern)}</span>`
+                        : '';
+                    return `
+                    <div class="my-playlist-group-item deleted ${isViewingDeleted && selectedGroupIndex === index ? 'active' : ''}"
                          onclick="selectGroup(${index}, true)">
-                        <span>${group.name}${group.isPartialDelete ? ' (隐藏频道)' : ''}</span>
+                        <span>${escapeHtml(group.name)}${group.isPartialDelete ? ' (隐藏频道)' : ''}${badge}</span>
                         <span style="color: #999; font-size: 12px;">${group.channels.length}</span>
                     </div>
-                `).join('');
+                `}).join('');
             }
         }
 
@@ -8083,33 +8478,8 @@ if(success){
             let group, groupIndex;
 
             if (isViewingDeleted) {
-                // 显示被删除的分组（支持通配符匹配）
-                const isGroupDeletedInDetail = (groupName) => {
-                    if (groupName === '公告') return false;
-                    return myPlaylistConfig.deletedGroups.some(pattern => {
-                        if (pattern.endsWith('*')) {
-                            return groupName.startsWith(pattern.slice(0, -1));
-                        }
-                        return pattern === groupName;
-                    });
-                };
-                const deletedGroups = myPlaylistOriginalData.filter(g =>
-                    !isSystemAnnouncementGroup(g) && isGroupDeletedInDetail(g.name)
-                );
-                const groupsWithHiddenChannels = myPlaylistOriginalData.map(g => {
-                    const hiddenChannels = g.channels.filter(ch => 
-                        myPlaylistConfig.hiddenChannels.includes(`${g.name}::${ch.id}`) &&
-                        !isGroupDeletedInDetail(g.name)
-                    );
-                    return hiddenChannels.length > 0 ? {
-                        ...g,
-                        channels: hiddenChannels,
-                        isPartialDelete: true
-                    } : null;
-                }).filter(g => g !== null);
+                const allDeletedGroups = hiddenAreaGroups();
 
-                const allDeletedGroups = [...deletedGroups, ...groupsWithHiddenChannels];
-                
                 // 调整selectedGroupIndex到有效范围
                 if (allDeletedGroups.length === 0) {
                     container.innerHTML = '<div style="text-align: center; padding: 40px; color: #999;">无隐藏内容</div>';
@@ -8271,6 +8641,7 @@ if(success){
                                         <div class="my-playlist-channel-actions">
                                             ${channel.url ? `<button class="channel-play-btn" title="在页面里播放" onclick="event.stopPropagation(); playInlineById('${channel.id}')">▶ 播放</button>` : ''}
                                             <button onclick="event.stopPropagation(); hideChannel('${channel.id}')">隐藏</button>
+                                            <button title="以后叫这个名字的频道都不再出现（源换地址也一样）" onclick="event.stopPropagation(); blockChannelByName('${channel.id}')">屏蔽</button>
                                         </div>
                                     ` : ''}
                                 </div>
@@ -8691,11 +9062,41 @@ if(success){
                 showStatus('自定义空分组不支持隐藏，请直接删除分组', 'error');
                 return;
             }
-            const confirmed = await showConfirm(`确定隐藏分组 "${group.name}" 吗？\n该分组的 ${group.channels.length} 个频道将被移到"已隐藏"区域`);
-            if (!confirmed) return;
-            
+            // 同前缀的兄弟分组（体育-昨天 / 今天 / 明天）：这类分组每天重建，只隐藏眼前这一个，
+            // 明天新的照样冒出来。deletedGroups 早就支持 `前缀*` 通配（issue #2 加的），但一直只有
+            // 手改配置文件才用得上。与其教用户敲通配符语法，不如在他真正需要的这一刻由界面认出来。
+            const siblings = groupPrefixSiblings(group.name);
+            let wildcardPrefix = null;
+            if (siblings) {
+                const preview = siblings.names.slice(0, 8).join('、') + (siblings.names.length > 8 ? ` …另 ${siblings.names.length - 8} 个` : '');
+                const choice = await showGroupChoice(
+                    '隐藏分组',
+                    `「${group.name}」还有 ${siblings.names.length} 个同前缀分组：\n${preview}\n\n`
+                    + `选「连同同前缀一起隐藏」会存成规则 ${siblings.prefix}*，`
+                    + `以后新出现的 ${siblings.prefix} 开头的分组也会自动隐藏——赛事回放这类每天重建的分组适合这么处理。`,
+                    [
+                        { key: 'one', label: `只隐藏这一个（${group.channels.length} 个频道）`, primary: true },
+                        { key: 'prefix', label: `连同 ${siblings.names.length} 个一起隐藏` },
+                    ]
+                );
+                if (!choice) return;
+                if (choice === 'prefix') wildcardPrefix = siblings.prefix + '*';
+            } else {
+                const confirmed = await showConfirm(`确定隐藏分组 "${group.name}" 吗？\n该分组的 ${group.channels.length} 个频道将被移到"已隐藏"区域`);
+                if (!confirmed) return;
+            }
+
             // 隐藏分组：需要把所有映射到此名称的原始分组都加入 deletedGroups
             const currentName = group.name;
+
+            if (wildcardPrefix) {
+                // 通配规则会盖住这些分组，原先逐条写进去的精确条目就是冗余了，一并清掉，
+                // 免得日后「解除规则」时残留一堆看不见的精确隐藏。
+                const prefix = wildcardPrefix.slice(0, -1);
+                myPlaylistConfig.deletedGroups = myPlaylistConfig.deletedGroups
+                    .filter(p => !(p === wildcardPrefix || (!p.endsWith('*') && p.startsWith(prefix))));
+                myPlaylistConfig.deletedGroups.push(wildcardPrefix);
+            }
 
             // 找出所有被重命名为当前名称的原始分组
             if (myPlaylistConfig.groupRenameMap) {
@@ -8709,8 +9110,9 @@ if(success){
                 }
             }
 
-            // 当前名称本身也可能是一个原始分组名（未被重命名过的）
-            if (!myPlaylistConfig.deletedGroups.includes(currentName)) {
+            // 当前名称本身也可能是一个原始分组名（未被重命名过的）。
+            // 选了通配规则时不再补这条：规则已经盖住它，多写一条精确条目会在「解除规则」后残留。
+            if (!wildcardPrefix && !myPlaylistConfig.deletedGroups.includes(currentName)) {
                 myPlaylistConfig.deletedGroups.push(currentName);
             }
             myPlaylistData.splice(index, 1);
@@ -8732,7 +9134,9 @@ if(success){
                 const result = await response.json();
                 if (result.success) {
                     await loadMyPlaylist(false);
-                    showStatus(`已隐藏分组 "${group.name}"`, 'success');
+                    showStatus(wildcardPrefix
+                        ? `已按规则 ${wildcardPrefix} 隐藏 ${siblings.names.length + 1} 个分组，以后新出现的也会自动隐藏`
+                        : `已隐藏分组 "${group.name}"`, 'success');
                 } else {
                     showStatus('隐藏失败', 'error');
                 }
@@ -8782,24 +9186,45 @@ if(success){
         async function restoreGroup() {
             if (!isViewingDeleted) return;
 
-            // 重新计算 deletedGroups（与渲染逻辑一致，支持通配符）
-            const deletedGroups = myPlaylistOriginalData.filter(group => {
-                return myPlaylistConfig.deletedGroups.some(pattern => {
-                    if (pattern.endsWith('*')) {
-                        return group.name.startsWith(pattern.slice(0, -1));
-                    }
-                    return pattern === group.name;
-                });
-            });
-            
-            if (selectedGroupIndex >= deletedGroups.length) return;
+            const group = hiddenAreaGroups()[selectedGroupIndex];
+            if (!group || group.isPartialDelete) return;
+            let restoreMessage = '';
 
-            const group = deletedGroups[selectedGroupIndex];
-            
-            // 从deletedGroups中移除精确匹配
-            myPlaylistConfig.deletedGroups = myPlaylistConfig.deletedGroups.filter(
-                name => name !== group.name
-            );
+            // 这个分组可能是被某条通配规则（`体育-*`）盖住的，而不是自己被精确隐藏的。
+            // 旧代码只 filter 精确匹配，对通配隐藏的分组点「恢复」什么都不会发生，
+            // 却照样弹「已恢复分组 X」——用户只会以为坏了。
+            const pattern = groupHiddenByPattern(group.name);
+            if (pattern && pattern.endsWith('*')) {
+                const covered = groupsCoveredByPattern(pattern);
+                const others = covered.filter(name => name !== group.name);
+                let restoreNote = '';
+                const choice = await showGroupChoice(
+                    '恢复分组',
+                    `「${group.name}」是被规则 ${pattern} 隐藏的，这条规则当前盖住 ${covered.length} 个分组：\n${covered.join('、')}`,
+                    [
+                        { key: 'all', label: `解除规则，恢复全部 ${covered.length} 个`, primary: true },
+                        { key: 'one', label: `只恢复「${group.name}」` },
+                    ]
+                );
+                if (!choice) return;
+                if (choice === 'all') {
+                    myPlaylistConfig.deletedGroups = myPlaylistConfig.deletedGroups.filter(p => p !== pattern);
+                    restoreNote = `已解除规则 ${pattern}，恢复 ${covered.length} 个分组`;
+                } else {
+                    // 规则换成「当前命中的分组逐条列出，去掉这一个」。副作用要讲清楚：
+                    // 以后新出现的同前缀分组不再自动隐藏了。
+                    myPlaylistConfig.deletedGroups = [
+                        ...myPlaylistConfig.deletedGroups.filter(p => p !== pattern),
+                        ...others,
+                    ];
+                    restoreNote = `已恢复「${group.name}」；规则 ${pattern} 已展开成 ${others.length} 条，以后新出现的同前缀分组不再自动隐藏`;
+                }
+                restoreMessage = restoreNote;
+            } else {
+                myPlaylistConfig.deletedGroups = myPlaylistConfig.deletedGroups.filter(
+                    name => name !== group.name
+                );
+            }
 
             // 先保存配置到服务器
             try {
@@ -8812,7 +9237,7 @@ if(success){
                 if (result.success) {
                     // 重新加载数据但保持当前视图
                     await loadMyPlaylist(false);
-                    showStatus(`已恢复分组 "${group.name}"`, 'success');
+                    showStatus(restoreMessage || `已恢复分组 "${group.name}"`, 'success');
                 } else {
                     showStatus('恢复失败', 'error');
                 }
@@ -8861,22 +9286,7 @@ if(success){
         async function restoreAllChannelsInGroup() {
             if (!isViewingDeleted) return;
 
-            const deletedGroups = myPlaylistOriginalData.filter(g => 
-                myPlaylistConfig.deletedGroups.includes(g.name)
-            );
-            const groupsWithHiddenChannels = myPlaylistOriginalData.map(g => {
-                const hiddenChannels = g.channels.filter(ch => 
-                    myPlaylistConfig.hiddenChannels.includes(`${g.name}::${ch.id}`) &&
-                    !myPlaylistConfig.deletedGroups.includes(g.name)
-                );
-                return hiddenChannels.length > 0 ? {
-                    ...g,
-                    channels: hiddenChannels,
-                    isPartialDelete: true
-                } : null;
-            }).filter(g => g !== null);
-
-            const allDeletedGroups = [...deletedGroups, ...groupsWithHiddenChannels];
+            const allDeletedGroups = hiddenAreaGroups();
             
             if (selectedGroupIndex >= allDeletedGroups.length) return;
 
@@ -8963,6 +9373,7 @@ if(success){
             if (h) h.textContent = '选择要重置的配置项，未选中的保留不变。仅重置当前档，其它档不受影响。';
             document.getElementById('resetRename').checked = true;
             document.getElementById('resetHidden').checked = true;
+            document.getElementById('resetRules').checked = true;
             document.getElementById('resetOrder').checked = true;
             document.getElementById('resetModal').style.display = 'block';
         }
@@ -8974,9 +9385,10 @@ if(success){
         async function executeReset() {
             const resetRename = document.getElementById('resetRename').checked;
             const resetHidden = document.getElementById('resetHidden').checked;
+            const resetRules = document.getElementById('resetRules').checked;
             const resetOrder = document.getElementById('resetOrder').checked;
 
-            if (!resetRename && !resetHidden && !resetOrder) {
+            if (!resetRename && !resetHidden && !resetRules && !resetOrder) {
                 showStatus('请至少选择一项', 'error');
                 return;
             }
@@ -8991,6 +9403,12 @@ if(success){
                 myPlaylistConfig.hiddenChannels = [];
                 myPlaylistConfig.deletedGroups = [];
                 parts.push('隐藏');
+            }
+            // 屏蔽规则（issue #123）单独一项：它是用户特意配的、重建成本高，
+            // 不能被笼统的「重置隐藏」顺手扫掉；但也不能漏——否则弹窗承诺「频道重新出现」却不出现
+            if (resetRules) {
+                myPlaylistConfig.hiddenRules = [];
+                parts.push('屏蔽规则');
             }
             if (resetOrder) {
                 myPlaylistConfig.groupOrder = [];
@@ -9027,22 +9445,7 @@ if(success){
         function selectAllChannels() {
             if (isViewingDeleted) {
                 // "已隐藏"区域
-                const deletedGroups = myPlaylistOriginalData.filter(g => 
-                    myPlaylistConfig.deletedGroups.includes(g.name)
-                );
-                const groupsWithHiddenChannels = myPlaylistOriginalData.map(g => {
-                    const hiddenChannels = g.channels.filter(ch => 
-                        myPlaylistConfig.hiddenChannels.includes(ch.id) &&
-                        !myPlaylistConfig.deletedGroups.includes(g.name)
-                    );
-                    return hiddenChannels.length > 0 ? {
-                        ...g,
-                        channels: hiddenChannels,
-                        isPartialDelete: true
-                    } : null;
-                }).filter(g => g !== null);
-
-                const allDeletedGroups = [...deletedGroups, ...groupsWithHiddenChannels];
+                const allDeletedGroups = hiddenAreaGroups();
                 if (selectedGroupIndex >= allDeletedGroups.length) return;
                 
                 const group = allDeletedGroups[selectedGroupIndex];
@@ -9247,24 +9650,7 @@ if(success){
 
             // 从hiddenChannels中移除选中的频道（使用 分组名::频道ID 格式）
             // 获取当前查看的已隐藏分组
-            const isGroupDeletedCheck = (groupName) => {
-                return myPlaylistConfig.deletedGroups.some(pattern => {
-                    if (pattern.endsWith('*')) {
-                        return groupName.startsWith(pattern.slice(0, -1));
-                    }
-                    return pattern === groupName;
-                });
-            };
-            const deletedGroupsList = myPlaylistOriginalData.filter(g => isGroupDeletedCheck(g.name));
-            const hiddenGroupsList = myPlaylistOriginalData.map(g => {
-                const hc = g.channels.filter(ch => 
-                    myPlaylistConfig.hiddenChannels.includes(`${g.name}::${ch.id}`) &&
-                    !isGroupDeletedCheck(g.name)
-                );
-                return hc.length > 0 ? { ...g, channels: hc, isPartialDelete: true } : null;
-            }).filter(g => g !== null);
-            const allDeletedGroupsList = [...deletedGroupsList, ...hiddenGroupsList];
-            const currentGroup = allDeletedGroupsList[selectedGroupIndex];
+            const currentGroup = hiddenAreaGroups()[selectedGroupIndex];
 
             selectedChannels.forEach(channelId => {
                 const hiddenKey = `${currentGroup.name}::${channelId}`;
@@ -9302,16 +9688,7 @@ if(success){
             const sel = document.getElementById('hiddenMoveSelect');
             if (!sel || !sel.value) return;
             const target = sel.value;
-            // 定位当前查看的隐藏分组（与 restoreSelectedChannels 同逻辑）
-            const isGroupDeletedCheck = (groupName) => myPlaylistConfig.deletedGroups.some(p =>
-                p.endsWith('*') ? groupName.startsWith(p.slice(0, -1)) : p === groupName);
-            const deletedGroupsList = myPlaylistOriginalData.filter(g => isGroupDeletedCheck(g.name));
-            const hiddenGroupsList = myPlaylistOriginalData.map(g => {
-                const hc = g.channels.filter(ch =>
-                    myPlaylistConfig.hiddenChannels.includes(`${g.name}::${ch.id}`) && !isGroupDeletedCheck(g.name));
-                return hc.length > 0 ? { ...g, channels: hc, isPartialDelete: true } : null;
-            }).filter(Boolean);
-            const currentGroup = [...deletedGroupsList, ...hiddenGroupsList][selectedGroupIndex];
+            const currentGroup = hiddenAreaGroups()[selectedGroupIndex];
             if (!currentGroup) return;
 
             if (!myPlaylistConfig.channelGroupMap) myPlaylistConfig.channelGroupMap = {};
