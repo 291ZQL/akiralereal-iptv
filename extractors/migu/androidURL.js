@@ -41,15 +41,17 @@ function getSaltAndSign(md5) {
 // fetchUrl 在超时/网络不通/非 JSON 响应时返回 undefined，部分风控/限流响应则没有 body 字段——
 // 此前直接读 respData.rid / respData.body 会抛 "Cannot read properties of undefined" 刷日志。
 // 统一返回干净的失败结果：channel() 会把 message 展示出来并按 1 分钟短缓存自动重试。
+// 海外部署不会走到这句：咪咕在海外照样回应，只是回「不可在当前地区播放」。咪咕会按单个
+// 服务器 IP 拒绝连接（issue #171，两位用户同机房换公网 IP 即恢复），所以提示里给出换 IP。
 function miguFetchFail(respData) {
   const message = (respData && (respData.message || respData.desc))
-    || "咪咕接口请求失败：网络超时或不可达（服务器挂代理、海外部署、DNS 异常最常见），请检查服务器到 miguvideo.com 的网络"
+    || "咪咕接口请求失败：网络超时或不可达（服务器挂代理、DNS 异常最常见；也可能是服务器 IP 被咪咕拒绝，换个公网 IP 试试），请检查服务器到 miguvideo.com 的网络"
   return { url: "", rateType: 0, content: { message, raw: respData } }
 }
 
 // playurl 各档位的文案，只用于日志。与 extractors/migu/index.js 的画质选项一致；
 // 咪咕回应里出现的档位以外的数字兜底按数字打印。
-const RATE_LABELS = { 1: '流畅', 2: '标清 540P', 3: '高清 720P', 4: '蓝光 1080P', 7: '原画', 9: '4K 臻享超高清' }
+const RATE_LABELS = { 1: '流畅', 2: '标清 540P', 3: '高清 720P', 4: '蓝光 1080P', 7: '原画', 8: '超清4K (投屏专享)', 9: '4K 臻享超高清' }
 function rateLabel(rt) { return RATE_LABELS[rt] || `档位 ${rt}` }
 
 // 把咪咕拒绝时的原话带进日志。此前拒绝一律打「该账号没有会员」，可用户明明有会员、
@@ -57,6 +59,50 @@ function rateLabel(rt) { return RATE_LABELS[rt] || `档位 ${rt}` }
 function serverHint(respData) {
   const msg = respData?.message
   return msg && msg !== 'SUCCESS' ? `（咪咕：${msg}）` : ''
+}
+
+/**
+ * 手机端回应里列着的「投屏专享」档（issue #117）。
+ *
+ * 咪咕赛事流除了手机端档位表（mediaFiles），还在 ottMediaFiles 里列着 rateType 8「超清4K
+ * (投屏专享)」——手机 App 投屏到电视时要的那条：3840×2160 HEVC 50 帧、约 26M，比手机端顶档
+ * （原画 1080p 约 6M、臻享 超高清 约 10M）高一大截，只给含电视端权益的会员。普通频道没有这一档。
+ *
+ * 只认 rateType 8，或同时带「投屏」和 4K 字样的项：档位表是升序的，只按「投屏」匹配会先撞上
+ * 将来可能出现的「蓝光 (投屏)」之类的低档。多项命中取表末尾的那项。
+ */
+function castTier(respData) {
+  const got = parseInt(respData?.body?.urlInfo?.rateType)
+  const list = respData?.body?.ottMediaFiles
+  if (!Array.isArray(list)) return null
+  const hits = list.filter(f => {
+    const rt = parseInt(f?.rateType)
+    const desc = String(f?.rateDesc || '')
+    return rt !== got && /投屏/.test(desc) && (rt === 8 || /4K|2160|超清/i.test(desc))
+  })
+  const hit = hits[hits.length - 1]
+  return hit ? { rateType: parseInt(hit.rateType), rateDesc: hit.rateDesc || rateLabel(parseInt(hit.rateType)) } : null
+}
+
+/**
+ * 投屏档那一次请求算不算拿到了。咪咕拿不到所请求档位时不一定拒绝：会以 SUCCESS 回一条
+ * 更低档的流，没权益时也可能只给几分钟试看。这两种都不能拿去顶掉手机端已经拿到的完整流——
+ * 顶掉了会按 pid 缓存 3 小时，用户体感就是「开了会员反而更差」。
+ */
+function castAccepted(castResp, cast) {
+  const info = castResp?.body?.urlInfo
+  if (castResp?.rid != 'SUCCESS' || !info?.url) return { ok: false, why: serverHint(castResp) }
+  if (parseInt(info.rateType) !== cast.rateType) return { ok: false, why: `（咪咕实际给的是 ${info.rateDesc || rateLabel(parseInt(info.rateType))}）` }
+  if ((parseInt(info.trySeeDuration) || 0) > 0) return { ok: false, why: `（只给试看 ${parseInt(info.trySeeDuration)} 秒）` }
+  return { ok: true, why: '' }
+}
+
+/**
+ * 这次取流带不带账号请求头。标清（rateType 2）一律按游客要——回应里的 auth.logined=false
+ * 就不能拿来判 Token 失效（resolve.js 的 noteAuth 据此跳过）。
+ */
+function sendsAccount(userId, token, rateType) {
+  return rateType != 2 && userId != "" && token != ""
 }
 
 async function getAndroidURL(userId, token, pid, rateType, opts = {}) {
@@ -85,7 +131,7 @@ async function getAndroidURL(userId, token, pid, rateType, opts = {}) {
     headers["appCode"] = "miguvideo_default_android"
   }
 
-  if (rateType != 2 && userId != "" && token != "") {
+  if (sendsAccount(userId, token, rateType)) {
     headers.UserId = userId
     headers.UserToken = token
   }
@@ -104,10 +150,10 @@ async function getAndroidURL(userId, token, pid, rateType, opts = {}) {
   }
   // 请求
   const baseURL = "https://play.miguvideo.com/playurl/v1/play/playurl"
-  const requestPlayurl = async (rt, withOtt) => {
+  const requestPlayurl = async (rt, extra = "") => {
     const params = "?sign=" + result.sign + "&rateType=" + rt
       + "&contId=" + pid + "&timestamp=" + timestramp + "&salt=" + result.salt
-      + "&flvEnable=true&super4k=true" + (withOtt ? "&ott=true" : "") + enableH265Str + enableHDRStr
+      + "&flvEnable=true&super4k=true" + enableH265Str + enableHDRStr + extra
     printDebug(`请求链接: ${baseURL + params}`)
     const resp = await doFetch(baseURL + params, {
       headers: headers
@@ -116,31 +162,37 @@ async function getAndroidURL(userId, token, pid, rateType, opts = {}) {
     return resp
   }
 
-  // 4K 先带 ott=true 请求。ott 是「大屏 / 电视终端」取流策略，咪咕按大屏（四屏）权益判定；
-  // 实测游客带 ott 直接 409 连降级流都不给，不带 ott 则正常给 540P、且 mediaFiles 里就列着
-  // rateType 9「臻享 超高清」——手机策略本身就有 4K。足球通这类不含电视端的「三屏」会员在
-  // 大屏策略下被判 TIPS_NEED_MEMBER，此前这里直接降到蓝光，1080P 就成了他们的天花板
-  // （issue #117）。现在被拒后先原样按手机策略再要一次 4K，仍被拒才降级；含大屏权益的
-  // 账号第一次就成功，路径不变。
-  let respData = await requestPlayurl(rateType, rateType == 9)
+  // 先按手机端策略要，不带 ott=true。单带 ott 咪咕会把这次当成电视盒子：无视 h265N / vivid，
+  // 档位表整张换成 H.264 那套（原画 901 而非 221306），四屏账号反而拿到 1080p H.264 SDR、
+  // HDR 开关失灵（issue #117，2026-10-06 同场对照）。手机策略本身就列着 rateType 9「臻享 超高清」。
+  let respData = await requestPlayurl(rateType)
   if (!respData) return miguFetchFail(respData)
 
-  if (respData.rid == 'TIPS_NEED_MEMBER' && rateType == 9) {
-    printYellow(`4K 按大屏策略被拒${serverHint(respData)}，改按手机策略再要一次 4K`)
-    respData = await requestPlayurl(9, false)
-    if (!respData) return miguFetchFail(respData)
+  // 画质选 4K、手机端回应里又列着「投屏专享」时，按 App 投屏的取法再要一次：ott=true 加
+  // ottPrior=mp4、rateType 8（2026-10-06 抓 iOS App 投屏请求得到；少了 ottPrior 就退回上面
+  // 那套 H.264）。没有电视端权益的账号拿不到，沿用手机端的流；普通频道没有这一档，不多请求。
+  if (rateType == 9 && respData.rid == 'SUCCESS' && respData.body?.urlInfo?.url) {
+    const cast = castTier(respData)
+    if (cast) {
+      const gotDesc = respData.body.urlInfo.rateDesc || rateLabel(parseInt(respData.body.urlInfo.rateType))
+      const castResp = await requestPlayurl(cast.rateType, "&ott=true&ottPrior=mp4")
+      const verdict = castAccepted(castResp, cast)
+      if (verdict.ok) respData = castResp
+      else printDebug(`「${cast.rateDesc}」没拿到${verdict.why}，沿用 ${gotDesc}`)
+    }
   }
+
   if (respData.rid == 'TIPS_NEED_MEMBER') {
     // 拒绝回应的 urlInfo.rateType 是咪咕愿意给的档位（同一字段在游客被拒时就是它降到的
     // 540P）。它给到蓝光或更高就先要蓝光，否则直接高清；再被拒一次兜底到高清。
     const offered = parseInt(respData.body?.urlInfo?.rateType)
     const fallback = offered >= 4 ? 4 : 3
     printYellow(`${rateLabel(rateType)} 超出账号权益${serverHint(respData)}，已降到 ${rateLabel(fallback)}`)
-    respData = await requestPlayurl(fallback, false)
+    respData = await requestPlayurl(fallback)
     if (!respData) return miguFetchFail(respData)
     if (respData.rid == 'TIPS_NEED_MEMBER' && fallback != 3) {
       printYellow(`${rateLabel(fallback)} 仍超出账号权益${serverHint(respData)}，已降到 ${rateLabel(3)}`)
-      respData = await requestPlayurl(3, false)
+      respData = await requestPlayurl(3)
     }
   }
   // console.log(respData)
@@ -323,4 +375,4 @@ function printStreamInfo(resObj, { cached = false } = {}) {
   }
 }
 
-export { getAndroidURL, getAndroidURL720p, get302URL, printStreamInfo }
+export { getAndroidURL, getAndroidURL720p, get302URL, printStreamInfo, sendsAccount }

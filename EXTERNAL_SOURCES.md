@@ -12,6 +12,7 @@
 - ✅ **Web 界面** - 可视化管理界面
 - ✅ **自动更新** - 定期更新外部源链接
 - ✅ **播放列表开关** - 可控制外部源是否写入 m3u/txt
+- ✅ **保留回看声明** - 订阅自带的 `catchup` / `catchup-days` / `catchup-source`（频道行或文件头）清洗后写回 m3u，声明了模板的频道按源自己的模板回看；没声明或只声明天数的频道，模板照旧继承订阅头的咪咕模板
 
 ## 使用方式
 
@@ -85,6 +86,11 @@ const m3u8Url = await extractM3u8FromWeb("https://www.example.com/tv.html", {
 }
 ```
 
+订阅模式（`"mode": "subscription"`）的源另有两个可选字段，后台订阅源卡片里的「User-Agent」一栏就是它们：
+
+- `userAgent`：拉订阅时用的 User-Agent，留空用默认浏览器 UA。有些订阅要特定 UA 才肯返回列表，按订阅提供方的要求填。失效检测也用它去探这个源的频道
+- `playWithUserAgent`：为 `true` 时，本源每个 http(s) 频道在 m3u 里都带上 `#EXTVLCOPT:http-user-agent=<userAgent>`，由播放器在播放时发出（需要播放器支持这一行，如 VLC、Kodi）。订阅里已自带 UA 的频道保持不变；带请求头的频道 TXT 格式放不下，不会出现在 TXT 订阅里
+
 ## API 接口
 
 ### 获取外部源配置
@@ -144,6 +150,7 @@ Content-Type: application/json
 3. **性能**：自动提取需要启动浏览器，较消耗资源
 4. **推荐方式**：建议手动获取 m3u8 后直接配置
 5. **播放列表开关**：`includeInPlaylists` 为 false 时，不会写入 m3u/txt
+6. **`${replace}` 是内部占位符**：输出订阅时它会被换成本机地址和访问密码 / 令牌，外部源（订阅、直连）里不能用。频道名、分组名、播放地址或台标带它的频道会被丢弃，日志里会点名是哪个源；`#EXTVLCOPT` 和回看模板里带它的那一项直接忽略（频道保留，日志不提示）
 
 ## 故障排除
 

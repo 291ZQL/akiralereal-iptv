@@ -33,6 +33,8 @@ import { dataList } from "../../utils/fetchList.js"
 import { resolve, clearCache } from "./resolve.js"
 import { enableMigu } from "../../config.js"
 import { setSystemFlagAPI } from "../../utils/systemConfigAPI.js"
+import { checkAccount, credentialRejected } from "./account.js"
+import danmaku from "./danmaku.js"
 
 /**
  * 跨分组去重：同一个 pID 只留在**最先出现**的那个分组里；
@@ -89,20 +91,28 @@ export function dedupeAcrossGroups(groups) {
 // 受账号/VIP 限制。最终播放列表不再输出「地方」，只保留官方模块
 // 尚未覆盖且用户明确要保留的频道，并直接并入对应地区。精确白名单刻意
 // 不自动接纳咪咕后续新增的地方频道，避免重复项刷新后悄悄复活。
-// 「上视东方影视」曾在此列并入上海，实测播放不了，已移到下方剔除名单。
+// 「上视东方影视」曾在此列并入上海，09-06 因取不到流剔除，09-28 复测能播，改走下方的补充名单。
+// 陕西银龄、都市青春、秦腔、新闻资讯四路曾在此并入陕西，陕西官方模块上线后已覆盖，撤掉。
 export const MIGU_LOCAL_REASSIGNMENTS = Object.freeze({
-  '陕西银龄频道': '陕西',
-  '陕西都市青春频道': '陕西',
-  '陕西秦腔频道': '陕西',
-  '陕西新闻资讯频道': '陕西',
   '财富天下': '江苏',
+})
+
+// 补充进地区分组的咪咕频道（issue #146）：打 supplement，排在同组官方模块的频道之后，
+// 也不决定分组位置（extractorManager.getValidChannels）。
+//   name        改成官方模块里的台名：同名播放器才会合成一个台的源1 / 源2
+//   officialEpg 节目单用官方模块的，不抓咪咕的
+export const MIGU_LOCAL_SUPPLEMENTS = Object.freeze({
+  // 看看新闻对没有网络版权的节目（主要是电视剧）暂停直播，这两台每天有大段放不了，咪咕
+  // 同一时段照常出画面（2026-09-28 实测）。咪咕新闻综合的节目单是过期模板（剧名停在上周）。
+  '上海新闻综合': { group: '上海', officialEpg: true },
+  '上海第一财经': { group: '上海', name: '第一财经', officialEpg: true },
+  // 看看新闻没有这个台，节目单照常用咪咕的
+  '上视东方影视': { group: '上海' },
 })
 
 // 这些地方频道还会出现在「新闻」等分类里，因此需要在
 // 所有咪咕分类中全局剔除，避免删掉「地方」组后又从别组复活。
 export const MIGU_CHANNEL_EXCLUSIONS = new Set([
-  // 咪咕这路取不到流、播不了；全局剔除，免得换个分类又冒出来
-  '上视东方影视',
   '中国天气',
   '公共新闻频道',
   '新动力量创一流',
@@ -119,9 +129,15 @@ export const MIGU_CHANNEL_EXCLUSIONS = new Set([
   '溧水新闻综合',
   '镇江新闻综合',
   '海南广播电视总台新闻频道',
+  // 陕西官方模块已覆盖；咪咕「新闻」分类里也挂着新闻资讯这一路，
+  // 只撤出上面的并入名单会让它换到「新闻」组单独冒出来
+  '陕西银龄频道',
+  '陕西都市青春频道',
+  '陕西秦腔频道',
+  '陕西新闻资讯频道',
 ])
 
-/** 清理咪咕地方重复源，并把少数保留频道合并进地区分组。 */
+/** 清理咪咕地方重复源，并把少数保留频道和补充频道合并进地区分组。 */
 export function redistributeMiguLocalChannels(groups) {
   const output = []
   const append = (name, channels) => {
@@ -143,8 +159,18 @@ export function redistributeMiguLocalChannels(groups) {
       continue
     }
     for (const channel of channels) {
-      const target = MIGU_LOCAL_REASSIGNMENTS[String(channel?.name || '').trim()]
+      const name = String(channel?.name || '').trim()
+      const target = MIGU_LOCAL_REASSIGNMENTS[name]
       if (target) append(target, [channel])
+      const supplement = MIGU_LOCAL_SUPPLEMENTS[name]
+      if (supplement) {
+        append(supplement.group, [{
+          ...channel,
+          ...(supplement.name ? { name: supplement.name } : {}),
+          ...(supplement.officialEpg ? { wantsPlayback: false } : {}),
+          supplement: true,
+        }])
+      }
     }
   }
   return output
@@ -225,7 +251,7 @@ export default {
         { value: 7, label: '原画 (1080p+ · 需VIP)' },
         { value: 9, label: '4K (2160p · 需VIP)' },
       ],
-      hint: '实际画质受咪咕账号档位限制：游客（不填账号）最高 540p；填免费咪咕账号可到 720p；蓝光 1080p / 原画 / 4K 需 VIP',
+      hint: '实际画质受咪咕账号档位限制：游客（不填账号）最高 540p；填免费咪咕账号可到 720p；蓝光 1080p / 原画 / 4K 需 VIP。选 4K 时，含电视端权益的会员在有「投屏专享」的赛事上会拿到 4K 投屏流',
     },
     {
       key: 'enableH265',
@@ -247,8 +273,9 @@ export default {
     },
     {
       // 原「系统配置」页里这一项就是 display:none 隐藏的，没有任何说明文案。
-      // 保持隐藏——让它突然出现在界面上，对「零变化」同样是变化。仍可用
-      // menableHDR 环境变量控制，与今天一致。
+      // 保持隐藏——让它突然出现在界面上，对「零变化」同样是变化。用 menableHDR
+      // 环境变量控制；hidden 字段的 env 压过已存值（老页面整份写回的 true 迁移过来后
+      // 曾把 env 顶死，issue #117），见 extractorManager.resolveConfig。
       key: 'enableHDR',
       label: '启用 HDR',
       type: 'boolean',
@@ -266,6 +293,8 @@ export default {
   // 只声明 key，具体markup 留在 admin.html——那边有配套的 CSS、引导弹窗和
   // bookmarklet 代码，拆开反而更碎。
   helper: 'migu-bookmarklet',
+
+  credentialCheck: { refresh: true, playback: true, degrade: 'Token 失效时咪咕照样给流，按游客播放（最高 540p）' },
 
   legacySystemConfigKeys: ['userId', 'token', 'rateType', 'enableHDR', 'enableH265', 'enableClientDispatch'],
 
@@ -294,9 +323,22 @@ export default {
    */
   resolve,
 
+  // 播放器「检测频道 / 测速 / 刷新预览图」会把整张列表逐一 GET 一遍：缓存只按台记 3 小时，
+  // 没缓存的台每台都带着站长账号向咪咕要一次地址，几秒内几十次（issue #177 账号被判「异常
+  // 播放行为」封禁，原因未证实，先堵这条路）。规则与央视频共用 utils/clientScanGuard.js。
+  resolveBurstGuard: true,
+
   clearResolveCache: clearCache,
 
-  async fetch() {
+  // 体育赛事直播弹幕（统一弹幕接口的直播扩展，见 DANMAKU.md）：/danmaku/migu/<pID>[/live|/segments]
+  // 走 app.js 的本机路由钩子，鉴权与频道地址同一套；聊天室 ID 由 updatePE 抓赛事时记下
+  claimsLocalPath: danmaku.claimsLocalPath,
+  handleLocalRequest: danmaku.handleLocalRequest,
+  shutdown: danmaku.shutdown,
+
+  credentialRejected,
+
+  async fetch(config = {}) {
     const { cates, failed } = await dataList()
 
     // 咪咕接口返回的就是 [{name, dataList}] 形状，与注册表契约天然同构，
@@ -322,14 +364,23 @@ export default {
       throw new Error(`咪咕分类数据本轮全部抓取失败（${failed.length} 个分类）：网络不可达或接口异常`)
     }
 
+    // 配了账号就拿第一个频道试要一次地址，看咪咕还认不认这个 Token（失效时只提醒，播放自动按游客）
+    const probe = deduped.find(g => g.dataList.length)?.dataList[0]?.pID
+    const account = await checkAccount(config, probe, { enableHDR: false, enableH265: false })
+
     return {
       groups: deduped,
       meta: {
         skipped: [],
         // 部分分类失败不算整轮失败，但要让「源管理」的健康状态看得见，
         // 不能像原来那样只在日志里刷一行就完事。
-        warnings: failed.map(name => `分类「${name}」本轮抓取失败，该分类频道缺失`),
+        warnings: [
+          ...failed.map(name => `分类「${name}」本轮抓取失败，该分类频道缺失`),
+          ...(account.warning ? [account.warning] : []),
+        ],
         requested: count,
+        // 没查成不下结论，后台沿用上一轮（registry.js）
+        credentialRejected: account.warning ? undefined : (account.rejected || ''),
       },
     }
   },

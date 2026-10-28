@@ -131,7 +131,7 @@ function mediaSegments(text, base) {
 
 async function fetchManifest(url, fetchImpl, signal) {
   const response = await fetchImpl(url, { redirect: 'follow', signal, headers: UPSTREAM_HEADERS })
-  if (!response.ok) throw new Error(`清单 HTTP ${response.status}`)
+  if (!response.ok) throw Object.assign(new Error(`清单 HTTP ${response.status}`), { status: response.status })
   const text = await response.text()
   if (!text.trimStart().startsWith('#EXTM3U')) throw new Error('响应不是 HLS 清单')
   return { text, url: response.url || url }
@@ -140,16 +140,24 @@ async function fetchManifest(url, fetchImpl, signal) {
 /**
  * 逐一检查官方主/备 CDN，取回能拍平成媒体清单的那一条。
  *
- * 只验证清单本身，不去试拉分片：官方 CDN 对短间隔的重复请求会直接回 403，
- * 而一次换票本就已经打了取票和清单两枪，再补一枪分片正好撞上限速——那样探活会在
- * CDN 完全正常时失败，把主备两条都误判成不可用，最终整个频道播不了。分片能否取到
- * 由播放器在真正播放时决定，它自己会重试，不需要这里替它预判。
+ * 只验证清单本身，不去试拉分片。v4.27.0 曾加过「每频道每 CDN 一分钟探一次分片」的选线，随后收回：
+ * 官方 CDN 对同一票据地址的重复请求大面积 403（2026-10-03 从家宽实测三家 CDN：阿里落到 ens 边缘
+ * 节点即拒、腾讯放行两次后拒、网宿看节点），服务端多打的这一枪既代表不了播放器出口的结果，在服务端
+ * 与播放器同出口的家庭部署里还会直接吃掉播放器取这一片的机会。分片能否取到由播放器在真正播放时
+ * 决定，它自己会重试，不需要这里替它预判。
+ *
+ * 每个入口最多等 MANIFEST_TIMEOUT_MS。官方入口偶尔会挂住不回应，原先等满 10 秒才换备用入口，
+ * 而播放器手里只有十几秒内容，这一等画面必停（libVLC 实测晚到 5～8 秒，主备都挂时等了 20 秒）。
+ * 正常取清单很快：经 NAS 实例统计 205 次，中位 0.15 秒、95% 在 0.7 秒内、最慢的正常响应不到 1 秒。
  */
+export const MANIFEST_TIMEOUT_MS = 3_000
+
 export async function selectWorkingManifest(urls, options = {}) {
   const fetchImpl = options.fetchImpl || fetch
   const errors = []
+  let forbidden = 0
   for (const url of urls) {
-    const timeout = withTimeout(Number(options.timeoutMs || 10_000))
+    const timeout = withTimeout(Number(options.timeoutMs || MANIFEST_TIMEOUT_MS))
     try {
       let manifest = await fetchManifest(url, fetchImpl, timeout.signal)
       const variant = firstVariant(manifest.text, manifest.url)
@@ -158,6 +166,7 @@ export async function selectWorkingManifest(urls, options = {}) {
       if (!segments.length) throw new Error('媒体清单没有分片')
       return { ...manifest, sourceUrl: url }
     } catch (error) {
+      if (error?.status === 403) forbidden++
       let host = '未知节点'
       try { host = new URL(url).hostname } catch { /* 保留默认文案 */ }
       errors.push(`${host}: ${error?.name === 'AbortError' ? '超时' : error?.message || error}`)
@@ -165,5 +174,8 @@ export async function selectWorkingManifest(urls, options = {}) {
       timeout.done()
     }
   }
-  throw new Error(`主、备用 CDN 均不可用（${errors.join('；')}）`)
+  // allForbidden：主备全是 403，即本机出口被 CDN 限流的特征，由解析层据此冷却
+  throw Object.assign(new Error(`主、备用 CDN 均不可用（${errors.join('；')}）`), {
+    allForbidden: urls.length > 0 && forbidden === urls.length,
+  })
 }

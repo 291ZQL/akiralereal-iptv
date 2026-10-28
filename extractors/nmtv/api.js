@@ -9,20 +9,26 @@ export const NMTV_API_KEY = '5b28bae827e651b3'
 const MAX_API_BYTES = 2 * 1024 * 1024
 const CHANNEL_LIST_TTL_MS = 30 * 1000
 const MEDIA_HOSTS = new Set(['play1-qk.nmtv.cn', 'livestream-bt.nmtv.cn'])
+const IMAGE_HOST = 'cdn-bt.nmtv.cn'
 
-function channel(ref, upstreamId, name, fallbackUrl = '') {
-  return Object.freeze({ ref, upstreamId, name, fallbackUrl })
+// rawName 是官网频道列表里的 title，按它认台标和直播地址；name 是播放列表里的台名。
+// 官网省级频道只写「新闻综合」「少儿频道」这类通用名，补上「内蒙古」再输出（issue #157）：
+// 少儿频道会按关键词复制进「少儿」分组，外部节目单也按带省名的台名对频道。盟市台的城市名本身不会撞，照原样。
+function channel(ref, upstreamId, rawName, { name = rawName, fallbackUrl = '' } = {}) {
+  return Object.freeze({ ref, upstreamId, rawName, name, fallbackUrl })
 }
 
 export const CHANNELS = Object.freeze([
-  channel('nmtv-satellite', 3621481, '内蒙古卫视', 'http://play1-qk.nmtv.cn/live/1769652018126032.m3u8'),
+  channel('nmtv-satellite', 3621481, '内蒙古卫视', { fallbackUrl: 'http://play1-qk.nmtv.cn/live/1769652018126032.m3u8' }),
   channel('nmtv-mongolian-satellite', 2315, '内蒙古蒙古语卫视'),
-  channel('nmtv-news-general', 2316, '新闻综合'),
-  channel('nmtv-economy-life', 2317, '经济生活'),
-  channel('nmtv-kids', 2318, '少儿频道'),
-  channel('nmtv-culture-sports', 2319, '文体娱乐'),
-  channel('nmtv-agriculture', 2320, '农牧频道'),
-  channel('nmtv-mongolian-culture', 2321, '内蒙古蒙古语文化频道', 'http://play1-qk.nmtv.cn/live/1769652109096027.m3u8'),
+  channel('nmtv-news-general', 2316, '新闻综合', { name: '内蒙古新闻综合' }),
+  channel('nmtv-economy-life', 2317, '经济生活', { name: '内蒙古经济生活' }),
+  channel('nmtv-kids', 2318, '少儿频道', { name: '内蒙古少儿' }),
+  channel('nmtv-culture-sports', 2319, '文体娱乐', { name: '内蒙古文体娱乐' }),
+  channel('nmtv-agriculture', 2320, '农牧频道', { name: '内蒙古农牧' }),
+  channel('nmtv-mongolian-culture', 2321, '内蒙古蒙古语文化频道', {
+    fallbackUrl: 'http://play1-qk.nmtv.cn/live/1769652109096027.m3u8',
+  }),
   channel('nmtv-hohhot', 2331, '呼和浩特'),
   channel('nmtv-baotou', 2358, '包头'),
   channel('nmtv-wuhai', 2355, '乌海'),
@@ -63,6 +69,23 @@ export function officialHlsUrl(raw) {
 export function upstreamHeadersFor(raw) {
   officialAssetUrl(raw)
   return { Referer: 'https://www.nmtv.cn/' }
+}
+
+/**
+ * 频道图标：频道接口每项的 image 就是官网直播页的频道图标（方图，盟市台是各台台标）。
+ * 图床带 CDN 鉴权，sign 每次请求都重签、去掉就 403，所以只能原样用接口当下给的地址，不能写死。
+ */
+export function officialLogoUrl(raw) {
+  try {
+    const url = new URL(String(raw || '').trim())
+    return url.protocol === 'https:' && url.hostname === IMAGE_HOST
+      && !url.username && !url.password && !url.port
+      && /^\/saas\/image\/[\w./-]+\.(?:png|jpe?g|webp)$/i.test(url.pathname)
+      ? url.href
+      : ''
+  } catch {
+    return ''
+  }
 }
 
 export function parsePortalResponse(text) {
@@ -145,9 +168,13 @@ async function cachedPortalChannels(options = {}) {
   return pending
 }
 
+function entryFor(channel, entries) {
+  return entries.find(item => Number(item?.id) === channel.upstreamId
+    && String(item?.title || '').trim() === channel.rawName)
+}
+
 function streamFor(channel, entries) {
-  const entry = entries.find(item => Number(item?.id) === channel.upstreamId
-    && String(item?.title || '').trim() === channel.name)
+  const entry = entryFor(channel, entries)
   const stream = entry && portalStream(entry)
   if (!stream) throw new Error(`官网当前没有返回${channel.name}直播地址`)
   const url = new URL(officialHlsUrl(stream))
@@ -158,14 +185,41 @@ function streamFor(channel, entries) {
   return url.href
 }
 
-export function buildChannels() {
+/** 频道表固定；台标按频道 ID 与台名从官网频道列表里认，没认到的留空。 */
+export function buildChannels(entries = []) {
   return CHANNELS.map(channel => ({
     name: channel.name,
     deferredRef: channel.ref,
-    logo: '',
+    logo: officialLogoUrl(entryFor(channel, entries)?.image),
     opts: ['network-caching=3000'],
     catchup: 'none',
   }))
+}
+
+/**
+ * 更新时取一次官网频道列表只为拿台标（签名地址见 officialLogoUrl）；取流仍在播放时做。
+ * 列表取不到就让这一轮失败：上一轮的频道和台标原样沿用、几分钟后重试。照常出频道反而会把
+ * 已有台标清空一整天——开机时网络还没通就是这样。
+ */
+export async function fetchChannels(ctx = {}) {
+  const timeoutMs = ctx.timeoutMs || 15000
+  let entries
+  try {
+    entries = await cachedPortalChannels({
+      fetchImpl: ctx.fetchImpl || proxyAwareFetch,
+      timeoutMs,
+      now: ctx.now,
+    })
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error(`内蒙古广电频道接口超时 ${timeoutMs}ms`)
+    throw error
+  }
+  const channels = buildChannels(entries)
+  const missing = channels.filter(item => !item.logo).length
+  const warnings = missing
+    ? [`官网频道列表里有 ${missing} 路没认到台标（官网可能改了频道 ID、台名或图床）`]
+    : []
+  return { channels, warnings }
 }
 
 export function claimsRef(ref) {

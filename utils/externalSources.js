@@ -5,7 +5,8 @@ import { dataPath } from "./paths.js"
 import { enableBuiltInSubscriptions } from "../config.js"
 import { printBlue, printGreen, printGrey, printRed, printYellow } from "./colorOut.js"
 import { extractM3u8FromWeb, validateM3u8 } from "./webSourceExtractor.js"
-import { collectOptsUntilUrl } from "./channelOpts.js"
+import { collectOptsUntilUrl, cleanUserAgent, withUserAgent } from "./channelOpts.js"
+import { parseCatchupAttrs, resolveCatchup, sanitizeCatchup } from "./channelCatchup.js"
 import { FailureBackoff } from "./refreshBackoff.js"
 import fetch from 'node-fetch'
 
@@ -35,15 +36,26 @@ function extractExtinfName(line) {
 function parseM3uContent(content) {
   const lines = content.split('\n').map(l => l.trim()).filter(l => l)
   const channels = []
+  // 文件头的回看声明对其后所有频道生效，行内逐字段覆盖（issue #190）。
+  // 拼接起来的多段列表每段各有文件头，遇到新的 #EXTM3U 就换成新的那份。
+  let headerCatchup = {}
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
+    if (/^\uFEFF?#EXTM3U/i.test(line)) {
+      headerCatchup = parseCatchupAttrs(line)
+      continue
+    }
     if (!line.startsWith('#EXTINF:')) continue
 
     // 解析 #EXTINF 行
     const groupMatch = line.match(/group-title="([^"]*)"/)
     const logoMatch = line.match(/tvg-logo="([^"]*)"/)
+    // 仓库自己的海外频道表用它标「服务端转发主清单、最高档挪到最前」的台（extractors/overseas）
+    const topFirst = /\sx-top-first="(?:1|true)"/i.test(line)
     const name = extractExtinfName(line)
+    // 源自带的回看模板 / 天数：不收下就只能继承订阅头的咪咕模板，回看静默失效（issue #190）
+    const catchup = resolveCatchup(headerCatchup, line)
 
     // 下一个非注释行是 URL；沿途的 #EXTVLCOPT 收进 opts（防盗链源靠它才播得动）
     const { opts, urlIndex } = collectOptsUntilUrl(lines, i)
@@ -55,7 +67,9 @@ function parseM3uContent(content) {
         group: groupMatch ? groupMatch[1] : '未分组',
         logo: logoMatch ? logoMatch[1] : '',
         url: url,
-        ...(opts.length ? { opts } : {})
+        ...(opts.length ? { opts } : {}),
+        ...(topFirst ? { topFirst: true } : {}),
+        ...catchup
       })
     }
   }
@@ -258,10 +272,18 @@ function describeFetchError(error) {
   return error?.code || error?.cause?.code || error?.cause?.message || error?.message || '未知错误'
 }
 
+// 拉订阅的默认 UA；订阅源设置里填了 User-Agent 就用填的（issue #170）
+const DEFAULT_SUBSCRIPTION_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+
 /**
  * 从远程 URL 获取并解析 m3u 播放列表（支持 GitHub 镜像回退）
+ *
+ * @param {object} [options]
+ * @param {string} [options.userAgent] 自定义 UA；不合法或留空用默认值
+ * @param {number} [options.timeoutMs] 每条线路的总超时（含读完响应体），默认 15 秒；测试用来压缩
  */
-async function fetchAndParseM3u(subscriptionUrl) {
+async function fetchAndParseM3u(subscriptionUrl, { userAgent, timeoutMs = 15000 } = {}) {
+  const ua = cleanUserAgent(userAgent) || DEFAULT_SUBSCRIPTION_UA
   const isGithubRaw = subscriptionUrl.includes('raw.githubusercontent.com')
   const mirrors = isGithubRaw ? GITHUB_RAW_MIRRORS : [(url) => url]
 
@@ -272,17 +294,18 @@ async function fetchAndParseM3u(subscriptionUrl) {
     // 拆出 URL 内嵌的 user:pass@ 凭据，转成 Basic 认证头（node-fetch 不接受带凭据的 URL）
     const { url: targetUrl, headers: authHeaders } = splitCredentials(transformedUrl)
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 15000)
+    // 超时要管到读完响应体：只管到响应头的话，对方发完头就停住会让这次拉取永远挂着，
+    // 进而卡死 5 分钟一轮的源刷新（防重入锁不释放，之后每轮都跳过，issue #195）
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
 
     try {
       const response = await fetch(targetUrl, {
         signal: controller.signal,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'User-Agent': ua,
           ...authHeaders
         }
       })
-      clearTimeout(timeoutId)
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}${response.statusText ? ' ' + response.statusText : ''}`)
@@ -290,6 +313,7 @@ async function fetchAndParseM3u(subscriptionUrl) {
 
       // 读原始字节并按编码解码（兼容 GBK/GB2312 订阅，避免分组/频道名乱码）
       const buffer = Buffer.from(await response.arrayBuffer())
+      clearTimeout(timeoutId)
       const content = decodeSubscriptionBody(buffer, response.headers.get('content-type'))
       const channels = parsePlaylistContent(content)
 
@@ -329,7 +353,8 @@ async function fetchAndParseM3u(subscriptionUrl) {
   }
 
   // 所有线路都失败：给出可操作的提示，而不是单条被截断的 node-fetch 报错
-  throw new Error(`所有线路均无法获取订阅，请检查服务器能否访问 GitHub/CDN（必要时配置代理或更换可访问的订阅地址）。已尝试: ${failures.join('，')}`)
+  // 订阅拉取不走代理，别在提示里让用户去配代理；服务端拉不到时给能当场用的出路
+  throw new Error(`所有线路均无法获取订阅，请检查服务器能否访问这个地址；访问不了的话，可更换能访问的订阅地址，或在电脑上下载后改用「本地文件 / 粘贴」导入。已尝试: ${failures.join('，')}`)
 }
 
 const EXTERNAL_SOURCES_PATH = dataPath('external-sources.json')
@@ -638,6 +663,9 @@ class ExternalSourceManager {
    * 添加新的外部源
    */
   addSource(sourceConfig) {
+    // 「复制到分组」的副本带上原频道的回看声明（issue #190），并记下声明对应的地址：
+    // 之后在后台改了地址，声明就不再输出（见 getValidChannels 的直连分支）
+    const catchup = sanitizeCatchup(sourceConfig)
     const newSource = {
       name: sourceConfig.name,
       group: sourceConfig.group || "其他",
@@ -654,7 +682,9 @@ class ExternalSourceManager {
         waitTime: sourceConfig.waitTime || 5000,
         headless: sourceConfig.headless !== false,
         ...sourceConfig.extractOptions
-      }
+      },
+      ...catchup,
+      ...(Object.keys(catchup).length ? { catchupUrl: sourceConfig.m3u8Url || "" } : {})
     }
     
     this.sources.sources.push(newSource)
@@ -785,7 +815,7 @@ class ExternalSourceManager {
 
     try {
       printBlue(`更新订阅源: ${source.name} (${source.subscriptionUrl})`)
-      const channels = await fetchAndParseM3u(source.subscriptionUrl)
+      const channels = await fetchAndParseM3u(source.subscriptionUrl, { userAgent: source.userAgent })
 
       const cur = this.relocateSource(source)
       if (!cur) return { success: false, message: '源已被删除，放弃写入订阅结果' }
@@ -957,7 +987,13 @@ class ExternalSourceManager {
 
       // 订阅模式：展开 parsedChannels
       if (source.mode === 'subscription' && Array.isArray(source.parsedChannels)) {
+        // 内置「精选频道」与地方官方同台时可被去重；其余外部源都是用户自己配的，
+        // channelMerger 的内容组归并据此不替换、不删除（邮件反馈：粘贴的少儿组播被顶掉）
+        const builtInSubscription = isBuiltInSubscriptionSource(source)
+        // 「播放时也带上」：在这里补而不是解析时补——开关一改、保存即生效，不必重新拉订阅（issue #170）
+        const playbackUa = source.playWithUserAgent === true ? source.userAgent : ''
         source.parsedChannels.forEach(ch => {
+          const opts = withUserAgent(ch.opts, playbackUa, ch.url)
           const group = resolveSubscriptionGroup(ch, source)
           if (!groupMap.has(group)) {
             groupMap.set(group, {
@@ -971,7 +1007,9 @@ class ExternalSourceManager {
             logo: ch.logo || "",
             groupTitle: group,
             sourceId: source.id ? `ext:${source.id}` : undefined,  // 源归属（issue #29/#68）
-            ...(ch.opts && ch.opts.length ? { opts: ch.opts } : {})
+            ...(builtInSubscription ? { builtInSubscription: true } : {}),
+            ...(opts && opts.length ? { opts } : {}),
+            ...sanitizeCatchup(ch)   // 源自带的回看声明（issue #190）；没有就不带，照旧继承订阅头
           })
         })
         return
@@ -991,7 +1029,9 @@ class ExternalSourceManager {
           url: source.m3u8Url,
           logo: source.logo || "",
           groupTitle: source.group,
-          sourceId: source.id ? `ext:${source.id}` : undefined   // 源归属（issue #29/#68）
+          sourceId: source.id ? `ext:${source.id}` : undefined,   // 源归属（issue #29/#68）
+          // 复制来的副本保留原频道的回看声明（issue #190），地址改过就不再适用
+          ...(source.catchupUrl && source.catchupUrl === source.m3u8Url ? sanitizeCatchup(source) : {})
         })
       }
     })

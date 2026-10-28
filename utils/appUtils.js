@@ -9,6 +9,8 @@ import { resolverFor, listModules } from "../extractors/registry.js";
 import { getExtractorManager, getModuleConfig } from "./extractorManager.js";
 import { omitPlayerOnlyOpts } from "./channelOpts.js";
 import { fetchUpstreamResponse } from "./hlsProxy.js";
+import { checkModuleBurst } from "./clientScanGuard.js";
+import miguDanmaku from "../extractors/migu/danmaku.js";
 
 /**
  * 清空各模块的解析缓存。
@@ -272,6 +274,11 @@ function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix, 
     replaceHost = `${replaceHost}/${urlUserId}/${urlToken}`
   }
 
+  // 体育赛事直播弹幕（DANMAKU.md）：有聊天室的赛事条目补 danmaku-url="${replace}/danmaku/migu/<pID>"。
+  // 必须在下面 relay/proxy 改写之前（它只认 ${replace}/纯数字 的地址行），也在 ${replace} 展开之前，
+  // 这样弹幕地址与频道地址同源、同访问前缀——Ceau 只认同源的弹幕地址。TXT 没有属性位，不处理。
+  if (url !== '/txt') result.content = miguDanmaku.decorateM3u(`${result.content}`)
+
   // 兼容版订阅（?relay=1，issue #98）：频道地址改为 /relay/<pid> 清单直出路径，
   // 供不跟随 302 跳转的播放器（极空间极影视、部分老电视盒）使用；
   // ?relay=2 为全代理版：频道地址改为 /proxy/<pid>，连分片也经服务器转发。
@@ -298,7 +305,12 @@ function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix, 
 
   // 剥离内部属性 source-ids（issue #29/#68 源归属标记）后再输出给播放器：
   // 覆盖两条路径——原始 interface.txt 直出 与 applyConfig 重生成（generateM3u8 不写该属性，正则兜底无副作用）
-  result.content = `${result.content}`.replace(/ source-ids="[^"]*"/g, "").replaceAll("${replace}", replaceHost);
+  // 值里不许有空白：真正的源归属（migu / ext:<id> / bi:<id> / xt:<id>，分号分隔）从不含空白，
+  // 放宽成 [^"]* 的话，第三方属性值里伪造的 ` source-ids=` 能跨到下一个属性。
+  // 必须先展开占位符再剥离：反过来的话，第三方地址行 / #EXTVLCOPT 里可以写
+  // `${re source-ids="x"place}`，剥掉中间一段正好拼出 `${replace}`，紧接着被换成带访问密码 /
+  // 令牌的本机地址发给第三方——汇总时只拦得住字面量（见 replaceToken.js）。
+  result.content = `${result.content}`.replaceAll("${replace}", replaceHost).replace(/ source-ids="[^"\s]*"/g, "");
 
   // 原始缓存直出和配置档重生成都在这里处理；TXT 没有 M3U 选项，EPG 已提前返回。
   if (url !== '/txt') result.content = omitPlayerOnlyOpts(result.content)
@@ -311,11 +323,16 @@ function interfaceStr(url, headers, urlUserId, urlToken, profile, accessPrefix, 
  *
  * 平台知识（签名、缓存、画质档位）已搬进 extractors/<id>/；这里只剩三件事：
  * 解析地址里的 ref 与回看参数、按 ref 路由到模块、把模块结果拼成 HTTP 响应。
+ * 外加一道客户端批量探测防护（checkModuleBurst），在路由到模块之后、调 resolve 之前：只对声明了
+ * resolveBurstGuard 的模块生效，按「模块｜客户端」计数，没声明的模块连账都不记。规则与依据见
+ * utils/clientScanGuard.js；同一模块的本地媒体入口（handleLocalRequest）与这里共用一本账。
  *
  * 失败一律 code=200 + 中文正文（app.js:881-888 直接用 result.code 写响应头），
  * 不改 4xx/5xx——那是存量播放器依赖的行为。
+ *
+ * client 可选：{ key, tag }，来自 app.js 的 clientOf(req)。不传就不计不拦（测试、旧调用方）。
  */
-async function channel(url, urlUserId, urlToken) {
+async function channel(url, urlUserId, urlToken, client, request = {}) {
 
   let result = {
     code: 200,
@@ -346,12 +363,34 @@ async function channel(url, urlUserId, urlToken) {
     return result
   }
 
+  // 播放器「刷新预览图 / 检测可用性 / 失败自动换台」式的批量探测：本地拒绝，一枪不打上游。
+  // 拒绝也走 code=200 + 中文正文，播放器看到的与普通解析失败无异。红字由 app.js 按 silent
+  // 跳过，这里按客户端每 10 秒归并成一行黄字，免得一次扫描刷出几十行。
+  if (module.resolveBurstGuard === true && client?.key) {
+    const verdict = checkModuleBurst({ moduleId: module.id, moduleName: module.name, client, channelKey: pid })
+    if (!verdict.allowed) {
+      if (verdict.logLine) printYellow(verdict.logLine)
+      result.desc = verdict.desc
+      result.silent = true
+      return result
+    }
+  }
+
   let resolved
   try {
     // ctx 带三样：账号（来自地址里的 /userId/token 段）、模块自己的生效配置
     // （画质等，effectiveConfig 是纯内存计算，不碰磁盘）、以及回看参数由外壳处理。
+    // 另带客户端身份和 selfBase（这位客户端访问本实例用的地址前缀，仅清单直出时有）：
+    // 模块要按播放器下发不同清单、或在清单里引用本机地址时用，用不上的模块不必理会。
+    // query 是播放地址「?」后的参数，模块可据此按频道覆盖配置（如 ?quality= 画质，issue #185）。
     const config = getExtractorManager().effectiveConfig(module)
-    resolved = await module.resolve(pid, { account: { userId: urlUserId, token: urlToken }, config })
+    resolved = await module.resolve(pid, {
+      account: { userId: urlUserId, token: urlToken },
+      config,
+      query: Object.fromEntries(new URLSearchParams(params)),
+      client,
+      selfBase: request.selfBase || '',
+    })
   } catch (error) {
     // 模块契约要求 resolve 不抛。万一抛了也绝不能让异常冒出去——app.js 的
     // 请求 handler 没有顶层 try，未捕获异常等于请求永远不 end、客户端挂死。
@@ -362,6 +401,8 @@ async function channel(url, urlUserId, urlToken) {
 
   if (!resolved || resolved.url == "") {
     result.desc = resolved?.desc || "服务异常"
+    // 模块自己按实例归并打过黄字的拒绝（央视频取票预算）同样不逐条刷红
+    if (resolved?.silent === true) result.silent = true
     return result
   }
 
@@ -389,7 +430,7 @@ async function channel(url, urlUserId, urlToken) {
   result.manifestUrl = resolved.manifestUrl
   // 平台可要求旧的无后缀入口也直出动态 HLS 清单；用于兼容已收藏/已下发的旧地址。
   result.relayHls = resolved.relayHls === true
-  result.streamType = module.streamType || 'hls'
+  result.streamType = resolved.streamType || module.streamType || 'hls'
   result.validateMediaUrl = resolved.validateMediaUrl
   return result
 }

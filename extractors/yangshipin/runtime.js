@@ -1,7 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-import { printBlue, printRed, printYellow } from '../../utils/colorOut.js'
+import { debug } from '../../config.js'
+import { checkModuleBurst } from '../../utils/clientScanGuard.js'
+import { printBlue, printGrey, printRed, printYellow } from '../../utils/colorOut.js'
 import { dataPath } from '../../utils/paths.js'
 import { AUTH_CHANNEL_BY_ID, AUTH_CHANNEL_BY_REF } from './channels.js'
 import {
@@ -11,6 +13,7 @@ import {
   YspBrowserLogin,
   YspBrowserSession,
 } from './browser-auth.js'
+import { FILLER_BODY, FILLER_PATH } from './libvlc-view.js'
 import { VipMseBridge } from './vip-bridge.js'
 
 const firstLine = error => String(error?.message || error || '未知错误').split('\n')[0]
@@ -19,7 +22,7 @@ const ACCOUNT_STATUS_TTL = 5 * 60_000
 
 /**
  * 登录态保活。官网 SDK 只在浏览器页面开着时才续期：刷新令牌 48 小时一到就作废，而后台
- * Chromium 会员频道停播 45 秒后就关掉、不会自己再开——家里两天没人看会员频道，登录就没了。
+ * Chromium 会员频道停播 3 分钟后就关掉、不会自己再开——家里两天没人看会员频道，登录就没了。
  * 所以只要「关联过账号」（标记文件在），就每隔一段时间静默拉起后台会话、让 SDK 续一次
  * 再由空闲回收关掉。标记里只有昵称和时间，不含任何凭据；没关联过的部署永远不会为此启动浏览器。
  */
@@ -27,22 +30,126 @@ const LOGIN_LINK_MARKER = dataPath('yangshipin/login-linked.json')
 const LOGIN_KEEPALIVE_INTERVAL_MS = 6 * 60 * 60_000
 const LOGIN_KEEPALIVE_INITIAL_DELAY_MS = 90_000
 
+/**
+ * 登录态失效记录。关联过的账号被官网判成未登录、或 VIP 权益掉了时写下，后台提醒中心据此提醒
+ * （见 registry.js 的 credentialRejected）；重新登录 / 导入成功即删除。关联标记在失效那一刻就被
+ * 删掉了，不另记的话「曾经登录过、现在掉了」这件事无从得知。只存原因、昵称和时间，不含凭据；
+ * 落盘是为了重启后还记得。
+ */
+const LOGIN_LOST_MARKER = dataPath('yangshipin/login-lost.json')
+export const LOGIN_LOST_NOTICE = `央视频登录态已失效（官网没认出关联过的账号），${AUTH_CHANNEL_BY_ID.size} 个会员频道暂时播不了；请在后台重新登录或导入登录态`
+export const VIP_LOST_NOTICE = `央视频账号的 VIP 权益已失效，${AUTH_CHANNEL_BY_ID.size} 个会员频道暂时播不了；续费后在后台点「检查登录态」`
+
 function readLoginLink() {
   try { return JSON.parse(readFileSync(LOGIN_LINK_MARKER, 'utf8')) } catch { return null }
 }
 
-function rememberLoginLink(status) {
+function readLoginLost() {
+  try { return JSON.parse(readFileSync(LOGIN_LOST_MARKER, 'utf8')) } catch { return null }
+}
+
+function writeLoginLost(reason, nickname, wasVip) {
+  const previous = readLoginLost()
+  mkdirSync(dirname(LOGIN_LOST_MARKER), { recursive: true })
+  writeFileSync(LOGIN_LOST_MARKER, JSON.stringify({
+    reason, nickname: String(nickname || ''), wasVip: wasVip === true || previous?.wasVip === true,
+    lostAt: previous?.lostAt || new Date().toISOString(),
+  }, null, 2))
+}
+
+function clearLoginLost() {
+  if (existsSync(LOGIN_LOST_MARKER)) unlinkSync(LOGIN_LOST_MARKER)
+}
+
+/** 后台状态接口用：关联过的央视频账号现在是否已失效。央视频没有配置项，config 用不上。 */
+export function credentialRejected() {
+  const lost = readLoginLost()
+  if (!lost) return ''
+  return lost.reason === 'vip' ? VIP_LOST_NOTICE : LOGIN_LOST_NOTICE
+}
+
+/**
+ * 判失效前先复查一次。官网用户信息接口偶尔慢或抽风，单次 sdk.info() 读空、VIP 字段没带回来都会
+ * 被当成掉登录；手动点「检查」又一切正常（10-21 作者实例上两天报了两次）。所以第一次读到
+ * 「失效」只记个疑点、30 秒后自己再读一次，隔开至少 20 秒的两次都不认才落失效记录；
+ * 中途任何一次读到正常就作罢。疑点 10 分钟没被证实也作废，免得几小时后的单次读空被当成第二次。
+ */
+const LOST_CONFIRM_DELAY_MS = 30_000
+const LOST_CONFIRM_MIN_GAP_MS = 20_000
+const LOST_SUSPICION_TTL_MS = 10 * 60_000
+let lostSuspicion = null  // { reason, at }
+let lostConfirmTimer = null
+
+function clearLostSuspicion() {
+  lostSuspicion = null
+  clearTimeout(lostConfirmTimer)
+  lostConfirmTimer = null
+}
+
+/** 这次读到的状态要落成哪种失效；不构成新的失效返回空。 */
+function lostReasonOf(status, previous) {
+  if (status?.authenticated) {
+    if (status.account?.vip === true) return ''
+    return previous?.vip === true || readLoginLost()?.wasVip === true ? 'vip' : ''
+  }
+  return previous || existsSync(LOGIN_LINK_MARKER) ? 'login' : ''
+}
+
+/** 这次失效是否已复查坐实；没坐实就记疑点、排一次复查。 */
+function lostConfirmed(reason, now) {
+  // 已经是这种失效了，照旧维持，不必再复查
+  if (readLoginLost()?.reason === reason) return true
+  if (lostSuspicion && now - lostSuspicion.at > LOST_SUSPICION_TTL_MS) clearLostSuspicion()
+  if (!lostSuspicion) {
+    lostSuspicion = { reason, at: now }
+    printYellow(`[央视频] 这次没读到${reason === 'vip' ? ' VIP 权益' : '登录账号'}，${LOST_CONFIRM_DELAY_MS / 1000} 秒后复查一次再下结论`)
+    lostConfirmTimer = setTimeout(confirmLoginLost, LOST_CONFIRM_DELAY_MS)
+    lostConfirmTimer.unref?.()
+    return false
+  }
+  if (now - lostSuspicion.at < LOST_CONFIRM_MIN_GAP_MS) return false
+  clearLostSuspicion()
+  return true
+}
+
+async function confirmLoginLost() {
+  lostConfirmTimer = null
+  if (!lostSuspicion) return
+  // 用户正在登录 / 导入，结果由那边定
+  if (browserLogin.active() || browserSession.visible) return
   try {
+    vipBridge.lastActivity = Date.now()
+    await browserSession.ensureBrowser({ visible: false })
+    // readAccount 会经 onAccount 回到 rememberLoginLink，由那里落定或作罢
+    const status = await browserSession.readAccount()
+    vipBridge.lastActivity = Date.now()
+    browserLogin.noteAccount(status)
+  } catch (error) {
+    printYellow(`[央视频] 登录态复查没完成：${firstLine(error)}，先不下结论`)
+  }
+}
+
+function rememberLoginLink(status, now = Date.now()) {
+  try {
+    const previous = readLoginLink()
+    const lostReason = lostReasonOf(status, previous)
+    if (lostReason && !lostConfirmed(lostReason, now)) return
+    if (!lostReason) clearLostSuspicion()
     if (status?.authenticated) {
       mkdirSync(dirname(LOGIN_LINK_MARKER), { recursive: true })
       writeFileSync(LOGIN_LINK_MARKER, JSON.stringify({
-        linkedAt: readLoginLink()?.linkedAt || new Date().toISOString(),
+        linkedAt: previous?.linkedAt || new Date().toISOString(),
         verifiedAt: new Date().toISOString(),
         nickname: String(status.account?.nickname || ''),
         vip: status.account?.vip === true,
       }, null, 2))
+      // VIP 从有到无才提醒，一直不是 VIP 的账号不算失效；掉了之后要等 VIP 回来才消
+      // 登录掉了又重新登录、但已不是 VIP 的，同样算 VIP 失效（失效记录里留着原先是不是 VIP）
+      if (lostReason === 'vip') writeLoginLost('vip', status.account?.nickname, true)
+      else clearLoginLost()
       scheduleLoginKeepalive()
-    } else if (existsSync(LOGIN_LINK_MARKER)) {
+    } else if (lostReason === 'login') {
+      writeLoginLost('login', previous?.nickname, previous?.vip)
       unlinkSync(LOGIN_LINK_MARKER)
     }
   } catch (error) {
@@ -51,7 +158,7 @@ function rememberLoginLink(status) {
 }
 
 const browserSession = new YspBrowserSession({ logger: log, onAccount: rememberLoginLink })
-const vipBridge = new VipMseBridge(browserSession, { logger: log })
+const vipBridge = new VipMseBridge(browserSession, { logger: log, traceNetwork: debug })
 const browserLogin = new YspBrowserLogin(browserSession, {
   beforeOpen: async () => {
     await vipBridge.suspend()
@@ -232,7 +339,7 @@ function isTopLevelRef(path) {
 
 export function claimsLocalPath(path) {
   const value = String(path || '')
-  return value.startsWith('/ysp-vip/') || Boolean(isTopLevelRef(value))
+  return value === FILLER_PATH || value.startsWith('/ysp-vip/') || Boolean(isTopLevelRef(value))
 }
 
 function response(status, contentType, body = '', headers = {}) {
@@ -273,11 +380,48 @@ function rangeResponse(body, rangeHeader) {
   })
 }
 
+/**
+ * 会员频道的批量探测防护。公开频道经 channel() → resolve 已有 resolveBurstGuard，会员频道走本地
+ * 媒体路由、不经 resolve，得在这里自己接上，并与公开频道共用「央视频｜客户端」一本账：一次扫描
+ * 从 63 个公开台一路扫进会员台，是同一次扫描。
+ *
+ * 真正花钱的是启动解扰桥：开一个浏览器页、用会员账号打开官网点进频道、最多等 25 秒片段，
+ * 启动还是排队串行的，客户端断开也不取消，同时最多 3 路、第 4 路会挤掉最久没用的一路。
+ * 入口主清单本身是本地写死的文本，但放行它播放器就会接着拉子清单、触发启动，所以两处都卡。
+ * 该频道的桥已在跑或正在启动时照常放行（exempt）：再给它请求不多开页，也不会误伤重拉主清单的观众。
+ * 分片只读已在跑的桥、HEAD/OPTIONS 本地应答，都不会启动任何东西，不过防护。
+ */
+function vipBurstRefusal(channel, client) {
+  const verdict = checkModuleBurst({
+    moduleId: 'yangshipin',       // 与 index.js 的 id 一致，公开/会员两条路由才落到同一本账
+    moduleName: '央视频',
+    client,
+    channelKey: `ysp-vip-${channel.id}`,
+    exempt: vipBridge.isActive(channel.id),
+  })
+  if (verdict.allowed) return null
+  if (verdict.logLine) printYellow(verdict.logLine)
+  return response(429, 'text/plain;charset=UTF-8', verdict.desc, { 'Retry-After': String(verdict.retryAfterSeconds) })
+}
+
+/**
+ * 会员频道请求跟踪：mdebug=1 时逐条打印播放器拉了哪份清单、哪个分片、离最新几片。
+ * 排「刚打开卡 / 播着播着卡」时，用它对照「解扰桥就绪」日志与官网分片到达节奏，看卡在哪一侧。
+ */
+function traceVip(channel, client, describe) {
+  if (!debug) return
+  try { printGrey(`[央视频] ${channel.name} ${describe()}｜${client?.tag || ''}`) } catch { /* 跟踪日志不影响播放 */ }
+}
+
 /** 模块本地媒体路由；app.js 只负责鉴权、选择模块及写 HTTP 响应。 */
-export async function handleLocalRequest({ path, method = 'GET', headers = {}, accessPrefix = '' } = {}) {
+export async function handleLocalRequest({ path, method = 'GET', headers = {}, accessPrefix = '', client } = {}) {
   const value = String(path || '')
+  // 公开频道 libVLC 清单里的垫片（见 libvlc-view.js）：固定的一段 TS 空包，与频道、账号无关
+  if (value === FILLER_PATH) {
+    return response(200, 'video/mp2t', method === 'GET' ? FILLER_BODY : '', { 'Cache-Control': 'public, max-age=86400' })
+  }
   const playlistMatch = value.match(/^\/ysp-vip\/([a-z0-9]+)\/(video|audio)\.m3u8$/i)
-  const assetMatch = value.match(/^\/ysp-vip\/([a-z0-9]+)\/(video|audio)\/(init|\d+)\.(?:mp4|m4s)$/i)
+  const assetMatch = value.match(/^\/ysp-vip\/([a-z0-9]+)\/(video|audio)\/(init|v?\d+|vpad\d+)\.(?:mp4|m4s)$/i)
   const topRef = isTopLevelRef(value)
   const channel = topRef
     ? AUTH_CHANNEL_BY_REF.get(topRef)
@@ -306,16 +450,36 @@ export async function handleLocalRequest({ path, method = 'GET', headers = {}, a
   if (browserLogin.active()) {
     return response(409, 'text/plain;charset=UTF-8', '央视频正在完成登录关联，请稍后重试')
   }
+  if (topRef || playlistMatch) {
+    const refused = vipBurstRefusal(channel, client)
+    if (refused) return refused
+  }
 
   try {
     if (topRef) {
       return response(200, 'application/vnd.apple.mpegurl', vipBridge.master(channel, accessPrefix))
     }
     if (playlistMatch) {
-      const body = await vipBridge.playlist(channel, playlistMatch[2].toLowerCase(), accessPrefix)
+      const kind = playlistMatch[2].toLowerCase()
+      const body = await vipBridge.playlist(channel, kind, accessPrefix, { userAgent: headers['user-agent'] })
+      if (debug) {
+        const state = vipBridge.streams.get(channel.id)
+        const media = state ? await vipBridge.mediaState(state) : null
+        traceVip(channel, client, () => {
+          const sequences = [...body.matchAll(/\/(v?\d+)\.m4s/g)].map(match => match[1])
+          return `${kind} 清单 ${sequences.length} 片 #${sequences[0]}..#${sequences.at(-1)}；${vipBridge.describeMedia(media)}`
+        })
+      }
       return response(200, 'application/vnd.apple.mpegurl', body)
     }
-    const body = vipBridge.asset(channel, assetMatch[2].toLowerCase(), assetMatch[3])
+    const kind = assetMatch[2].toLowerCase()
+    const body = vipBridge.asset(channel, kind, assetMatch[3])
+    traceVip(channel, client, () => {
+      if (assetMatch[3] === 'init') return `${kind} init${body ? '' : '（已过期）'}`
+      const edge = /^\d+$/.test(assetMatch[3]) ? vipBridge.edge(channel, kind) : null
+      const behind = edge == null ? '' : `，距最新 ${edge - Number(assetMatch[3])} 片`
+      return `${kind} #${assetMatch[3]}${behind}${headers.range ? ` range=${headers.range}` : ''}${body ? '' : '（已过期）'}`
+    })
     if (!body) return response(404, 'text/plain;charset=UTF-8', '央视频会员片段已过期，请让播放器刷新清单')
     return rangeResponse(body, headers.range)
   } catch (error) {
@@ -333,6 +497,7 @@ export function shutdown() {
     clearTimeout(keepaliveTimer)
     clearInterval(keepaliveTimer)
     keepaliveTimer = null
+    clearLostSuspicion()
     await browserLogin.cancel({ restore: false })
     await vipBridge.close()
     await browserSession.close()
@@ -346,4 +511,5 @@ export const runtime = {
   vipBridge,
   browserLogin,
   loginLink: { markerPath: LOGIN_LINK_MARKER, read: readLoginLink, remember: rememberLoginLink },
+  loginLost: { markerPath: LOGIN_LOST_MARKER, read: readLoginLost },
 }

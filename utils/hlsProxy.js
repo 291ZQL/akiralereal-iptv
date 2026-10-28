@@ -52,6 +52,10 @@ function markManifestResult(key, ok, now = Date.now()) {
 const TTL_MS = 10 * 60 * 1000     // 滑动空闲 TTL：活跃请求续期，停播 10 分钟后回收
 const MAX_ENTRIES = 5000          // 一个直播频道 10 分钟约 100 条，这个上限够几十路同放，超出按最早登记淘汰
 
+// Finite playlists are read once: later segments must survive while that VOD
+// session is active, even when the player never reloads its manifest.
+const vodSessions = new Map()
+const activeVod = (entry, now) => (vodSessions.get(entry.pid) || 0) > now
 const registry = new Map()        // key -> { url, pid, transform, upstreamHeaders, upstreamUrlTransform, expires }
 
 // 已知的媒体后缀：保留原后缀，按后缀识别流格式的播放器（极影视）才认得出分片
@@ -71,8 +75,9 @@ function extOf(url, fallback) {
 function sweep() {
   const now = Date.now()
   for (const [key, entry] of registry) {
-    if (entry.expires <= now) registry.delete(key)
+    if (entry.expires <= now && !activeVod(entry, now)) registry.delete(key)
   }
+  for (const [pid, expires] of vodSessions) if (expires <= now) vodSessions.delete(pid)
   // 扫完仍超上限：Map 迭代序即插入序，从最早的开始丢
   while (registry.size > MAX_ENTRIES) {
     const oldest = registry.keys().next()
@@ -109,12 +114,13 @@ function lookup(key) {
   const entry = registry.get(key)
   if (!entry) return null
   const now = Date.now()
-  if (entry.expires <= now) {
+  if (entry.expires <= now && !activeVod(entry, now)) {
     registry.delete(key)
     return null
   }
   // master 里的子清单只在首次改写时登记，播放器随后会直接轮询该子清单；若 lookup 不续期，
   // 正常播放也会在固定 10 分钟后变成 404。删后重插同时把活跃项移到 LRU 队尾。
+  if (activeVod(entry, now)) vodSessions.set(entry.pid, now + TTL_MS)
   entry.expires = now + TTL_MS
   registry.delete(key)
   registry.set(key, entry)
@@ -141,6 +147,11 @@ function registrySize() {
  * 纯字符串处理（除登记地址表外无副作用），便于单测。
  */
 function toProxyManifest(text, pid = '', transform, upstreamHeaders, upstreamUrlTransform) {
+  if (pid && /^#EXT-X-ENDLIST\s*$/m.test(text)) {
+    for (const [key, expires] of vodSessions) if (expires <= Date.now()) vodSessions.delete(key)
+    if (vodSessions.size >= MAX_ENTRIES && !vodSessions.has(pid)) vodSessions.delete(vodSessions.keys().next().value)
+    vodSessions.set(pid, Date.now() + TTL_MS)
+  }
   const toRef = (uri, fallbackExt) => {
     if (!/^https?:\/\//i.test(uri)) return null   // 非绝对地址说明上一步改写没覆盖到，保持原样别弄坏
     try {
@@ -176,9 +187,9 @@ function toProxyManifest(text, pid = '', transform, upstreamHeaders, upstreamUrl
  * 码率或流格式。真遇到某个平台因 UA 取流异常，就针对那一个模块改并实测，不要整体翻。
  *
  * 唯一的例外是**函数形态**的 upstreamHeaders：它本就是模块按每一跳目标精确决定请求头的契约，
- * 它返回的 User-Agent 会原样发出。目前只有安徽视讯用到——该 CDN 按播放器标识放行，App 的
- * ijkplayer 与这个 Chrome UA 都能过，VLC / AppleCoreMedia / ExoPlayer 等一律 403，走 App 自己
- * 验证过的标识最稳。加这条例外时其余函数形态模块都没有声明 UA，它们的行为不变。
+ * 它返回的 User-Agent 会原样发出，让模块按 CDN 当前规则选择兼容标识。安徽视讯的旧
+ * live 域名使用 Chrome UA，2026-10-25 切换的 seclive 域名则使用 ijkplayer。
+ * 加这条例外时其余函数形态模块都没有声明 UA，它们的行为不变。
  */
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 

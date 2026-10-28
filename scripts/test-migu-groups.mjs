@@ -10,7 +10,8 @@
  *
  * 规则：同一个 pID 只留在**最先出现**的分组里，CCTV5 / CCTV5+
  * 例外地同时保留在体育和央视；同时咪咕「地方」不直接输出，
- * 只把明确保留的独有频道并入上海 / 陕西 / 江苏。
+ * 只把明确保留的独有频道并入对应地区（目前只剩财富天下并入江苏），外加并入「上海」
+ * 的补充频道（新闻综合、第一财经给看看新闻作源2，东方影视是看看新闻没有的台）。
  *
  * 这是条纯数据整形规则，改错了**不会报错** —— 频道只是悄悄跑到别的分组、
  * 或者又开始到处重复。所以把它钉在这里。
@@ -86,31 +87,58 @@ check('空输入 / 空分组不炸', () => {
   assert.deepEqual(dedupeAcrossGroups([{ name: '体育', dataList: [] }]), [])
 })
 
-check('咪咕地方组只保留指定独有频道，并归入陕西 / 江苏', () => {
+check('咪咕地方组只保留指定独有频道和补充频道，归入江苏 / 上海；陕西四路已由官方模块覆盖', () => {
   const local = {
     name: '地方',
     dataList: [
-      { pID: '1', name: '上海新闻综合' },          // 上海官方模块已有：丢弃
-      { pID: '2', name: '上视东方影视' },          // 播放不了：剔除
+      { pID: '1', name: '上海新闻综合' },          // 看看新闻被版权屏蔽时的源2：见下面的用例
+      { pID: '2', name: '上视东方影视' },          // 看看新闻没有：补进上海
       { pID: '3', name: '南京新闻综合频道' },      // 南京官方模块已有：丢弃
       { pID: '4', name: '盐城新闻综合' },          // 江苏地市频道：丢弃
-      { pID: '5', name: '陕西银龄频道' },          // 陕西：保留
-      { pID: '6', name: '陕西都市青春频道' },      // 陕西：保留
-      { pID: '7', name: '陕西秦腔频道' },          // 陕西：保留
-      { pID: '8', name: '陕西新闻资讯频道' },      // 陕西：保留
+      { pID: '5', name: '陕西银龄频道' },          // 陕西官方模块已有：丢弃
+      { pID: '6', name: '陕西都市青春频道' },      // 陕西官方模块已有：丢弃
+      { pID: '7', name: '陕西秦腔频道' },          // 陕西官方模块已有：丢弃
+      { pID: '8', name: '陕西新闻资讯频道' },      // 陕西官方模块已有：丢弃
       { pID: '9', name: '财富天下' },              // 江苏：保留
       { pID: '10', name: '广东珠江频道' },         // 广东官方模块已有：丢弃
     ],
   }
   const out = redistributeMiguLocalChannels([g('体育', 100), local, g('影视', 200)])
-  assert.deepEqual(out.map(group => group.name), ['体育', '陕西', '江苏', '影视'])
+  assert.deepEqual(out.map(group => group.name), ['体育', '上海', '江苏', '影视'])
   assert.deepEqual(shape(out), [
     ['体育', ['100']],
-    ['陕西', ['5', '6', '7', '8']],
+    ['上海', ['1', '2']],
     ['江苏', ['9']],
     ['影视', ['200']],
   ])
   assert.equal(out.some(group => group.name === '地方'), false)
+})
+
+// issue #146：看看新闻对没有网络版权的节目（主要是电视剧）暂停直播，咪咕同一时段照常出画面
+check('上海三台并入上海作补充：打 supplement，第一财经改成看看新闻的台名，不改动原对象', () => {
+  const news = { pID: '651632657', name: '上海新闻综合', wantsPlayback: true }
+  const finance = { pID: '608780988', name: '上海第一财经', wantsPlayback: true }
+  const drama = { pID: '617290047', name: '上视东方影视', wantsPlayback: true }
+  const [shanghai] = redistributeMiguLocalChannels([{ name: '地方', dataList: [news, finance, drama] }])
+  assert.equal(shanghai.name, '上海')
+  assert.deepEqual(shanghai.dataList, [
+    // 看看新闻也有这两台：节目单用它的官方节目单，不抓咪咕的
+    { pID: '651632657', name: '上海新闻综合', wantsPlayback: false, supplement: true },
+    { pID: '608780988', name: '第一财经', wantsPlayback: false, supplement: true },
+    // 看看新闻没有：节目单照常抓咪咕的
+    { pID: '617290047', name: '上视东方影视', wantsPlayback: true, supplement: true },
+  ])
+  assert.equal(news.wantsPlayback, true, '不该原地改咪咕返回的频道对象')
+  assert.equal(finance.name, '上海第一财经')
+  assert.equal('supplement' in drama, false)
+})
+
+check('补充频道只从「地方」取：别的分类里同名频道不并入', () => {
+  const out = redistributeMiguLocalChannels([
+    { name: '新闻', dataList: [{ pID: '651632657', name: '上海新闻综合' }] },
+  ])
+  assert.deepEqual(shape(out), [['新闻', ['651632657']]])
+  assert.equal(out[0].dataList[0].supplement, undefined)
 })
 
 check('咪咕新闻频道全部剔除，去掉空的新闻分组', () => {
@@ -129,17 +157,19 @@ check('咪咕新闻频道全部剔除，去掉空的新闻分组', () => {
       { pID: '10', name: '溧水新闻综合' },
       { pID: '11', name: '镇江新闻综合' },
       { pID: '12', name: '海南广播电视总台新闻频道' },
+      { pID: '13', name: '陕西新闻资讯频道' },       // 陕西官方模块已有；只撤并入名单时会在新闻组冒出来
     ],
   }
   assert.deepEqual(redistributeMiguLocalChannels([news]), [])
 })
 
-check('上视东方影视无论出现在哪个分类都剔除（播放不了）', () => {
+// 09-06 因取不到流全局剔除，09-28 复测游客、登录都能播，撤出剔除名单
+check('上视东方影视不再剔除：从地方补进上海', () => {
   const input = [
-    { name: '影视', dataList: [{ pID: '1', name: '上视东方影视' }, { pID: '2', name: '南方影视' }] },
     { name: '地方', dataList: [{ pID: '1', name: '上视东方影视' }] },
+    { name: '影视', dataList: [{ pID: '2', name: '南方影视' }] },
   ]
-  assert.deepEqual(shape(redistributeMiguLocalChannels(input)), [['影视', ['2']]])
+  assert.deepEqual(shape(redistributeMiguLocalChannels(input)), [['上海', ['1']], ['影视', ['2']]])
 })
 
 check('咪咕熊猫分组整组移除（iPanda 官方模块已覆盖）', () => {
@@ -191,12 +221,12 @@ check('文旅精简会剔除专题轮播和已有地方官方源的副本', () =
 
 check('重分组会合并已有地区组，且不修改输入', () => {
   const input = [
-    { name: '陕西', dataList: [{ pID: '1', name: '旧频道' }] },
-    { name: '地方', dataList: [{ pID: '2', name: '陕西银龄频道' }] },
+    { name: '江苏', dataList: [{ pID: '1', name: '旧频道' }] },
+    { name: '地方', dataList: [{ pID: '2', name: '财富天下' }] },
   ]
   const before = JSON.stringify(input)
   const out = redistributeMiguLocalChannels(input)
-  assert.deepEqual(shape(out), [['陕西', ['1', '2']]])
+  assert.deepEqual(shape(out), [['江苏', ['1', '2']]])
   assert.equal(JSON.stringify(input), before)
 })
 

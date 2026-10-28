@@ -2,11 +2,16 @@ import { getAllChannels, updateExternalSources, updateBuiltInSources, updateExtr
 import { getExtractorManager, getModuleConfig } from "./extractorManager.js"
 import { appendFile, appendFileSync, copyFileSync, renameFileSync, writeFile, writeFileSync } from "./fileUtil.js"
 import { updatePlaybackData } from "./playback.js"
-import { aggregateExternalEpg } from "./epgAggregator.js"
+import { aggregateExternalEpg, loadOverrideKeys } from "./epgAggregator.js"
+import { appendModuleEpg } from "./moduleEpg.js"
 import { normalizeKey, logoMatchName } from "./channelNormalize.js"
 import { ensureLogoIndex, resolveLibraryLogo } from "./logoLibrary.js"
 import { renderOpts, needsOpts } from "./channelOpts.js"
-import { refreshToken as enableTokenRefresh, host, pass, enableMigu, externalLogoBase } from "../config.js"
+import { renderCatchupAttrs } from "./channelCatchup.js"
+import { hasReplaceToken } from "./replaceToken.js"
+import { refreshToken as enableTokenRefresh, host, pass, enableMigu, externalLogoBase, enableLogoCache } from "../config.js"
+import { finishLogoCache, hostedLogoUrl, prefetchLogos } from "./logoCache.js"
+import { packLogoUrl } from "./logoPack.js"
 import refreshToken from "./refreshToken.js"
 import { printGreen, printRed, printYellow, printBlue } from "./colorOut.js"
 import { getDateString } from "./time.js"
@@ -15,6 +20,7 @@ import { dataPath } from "./paths.js"
 import { readMiguTokenState, markMiguTokenRefreshed, MIGU_TOKEN_REFRESH_INTERVAL_MS } from "./miguTokenState.js"
 import { readFileSync, existsSync, statSync } from "node:fs"
 import { announcementM3uEntry, announcementTxtEntry } from "./announcement.js"
+import miguDanmaku from "../extractors/migu/danmaku.js"
 
 const PE_CACHE_PATH = dataPath('pe-cache.json')
 
@@ -43,6 +49,34 @@ function localLogoVersion(file) {
   } catch {
     return ''
   }
+}
+
+// 本地上传的台标：显示名优先，台标匹配名兜底（issue #40：CCTV1高清（电信）→ CCTV1）
+function localLogo(name) {
+  const key = logoMatchName(name)
+  return findLocalLogo(name) || (key && key !== name ? findLocalLogo(key) : '')
+}
+
+/**
+ * 频道自己的台标（咪咕 pics / 模块官方 / m3u 手写）、仓库内置台标与台标库兜底，按优先级排好的候选。
+ * 本地上传的不在这里：它最优先，也不需要托管。内置台标本机直接提供、不经托管：自带的确认坏了，
+ * 或还没下载成功（比如海外服务器连不上大陆图床）时就用它。库兜底只给外部 / 内置 / 抓取模块频道。
+ */
+function logoCandidates(channelItem, groupName, libraryAllowed) {
+  const candidates = []
+  const own = channelItem.pics?.highResolutionH || channelItem.logo || ''
+  if (own) candidates.push({ url: own, from: 'source' })
+  const packed = packLogoUrl(channelItem, groupName)
+  if (packed) candidates.push({ url: packed, from: 'pack' })
+  if (libraryAllowed && externalLogoBase) {
+    // 有索引就只写库里真实存在的图（issue #124）：查不到就不给这个候选，让播放器出自己的占位图，
+    // 而不是一个必定 404 的地址（裂图）。景观/慢直播这类「频道名不是台名」的伪频道
+    // 天然查不到，正好自动留空。索引不可用时（首次没网/库改版）退回按名盲拼的老行为。
+    const libraryName = resolveLibraryLogo(channelItem.name, groupName)
+    const name = libraryName === null ? (logoMatchName(channelItem.name) || channelItem.name) : libraryName
+    if (name) candidates.push({ url: `${externalLogoBase}${encodeURIComponent(name)}.png`, from: 'auto' })
+  }
+  return candidates
 }
 
 /** 现有播放列表正文；文件不存在（首次部署）或读不出来都返回空串——「没有可保的东西」。 */
@@ -294,9 +328,40 @@ async function updateTV(hours, options = {}) {
 
   // 分组列表
   const includeExternalInPlaylists = externalSourceManager.sources?.includeInPlaylists !== false
+
+  // 台标本机托管（utils/logoCache.js）：先把这一轮要用的候选台标下载好，写列表时挑已托管的。
+  // 快速重生成不下载，只用已有的托管结果。
+  if (enableLogoCache && !regenerateOnly) {
+    const urls = []
+    for (const group of datas) {
+      for (const channelItem of group.dataList) {
+        const isExtractor = channelItem.source === 'extractor'
+        const isExternal = !isExtractor && (channelItem.source === 'external' || !!channelItem.url)
+        if ((isExternal && !includeExternalInPlaylists) || localLogo(channelItem.name)) continue
+        const libraryAllowed = isExternal || isExtractor || channelItem.source === 'built-in'
+        for (const candidate of logoCandidates(channelItem, group.name, libraryAllowed)) urls.push(candidate.url)
+      }
+    }
+    try {
+      await prefetchLogos(urls)
+    } catch (e) {
+      printYellow(`台标托管下载失败，本轮沿用原台标地址: ${e.message}`)
+    }
+  }
   // EPG 聚合（issue #38）用：本次写入播放列表的频道原始名 + 已由咪咕给到 EPG 的频道归一 key
   const playlistChannelNames = []
   const epgCoveredKeys = new Set()
+  // 带自有节目单的模块频道（extractors/<id>/epg.js），在咪咕之后、外部聚合之前补
+  const moduleEpgChannels = []
+  // 用户勾了「优先于官方节目单」的外部源此刻有节目的频道：咪咕与模块节目单让出来，由外部聚合写
+  let epgOverrideKeys = new Set()
+  if (!regenerateOnly) {
+    try {
+      epgOverrideKeys = await loadOverrideKeys()
+    } catch (e) {
+      printYellow(`「优先于官方节目单」的外部源读取失败，这些频道照常用官方节目单: ${e.message}`)
+    }
+  }
   // 因依赖请求头而未写进 txt 的频道数。静默跳过会让用户「莫名少台」且日志里毫无线索，
   // 排查成本从「看一眼日志」变成「提 issue」。
   let txtSkipped = 0
@@ -319,27 +384,15 @@ async function updateTV(hours, options = {}) {
       const isExtractor = channelItem.source === 'extractor'
       const isExternal = !isExtractor && (channelItem.source === 'external' || !!channelItem.url)
       // 台标优先级：本地 logos/<频道名>.<ext>（用户后台上传或手动放，最高、仅查本地不联网）
-      //   > 源自带台标（咪咕 pics / m3u 手写）> 公共台标库兜底（仅外部/内置）> 空。
-      // 取图用「台标匹配名」做 key（issue #40）：CCTV1高清（电信）→ CCTV1、湖南卫视（电信）→ 湖南卫视，
-      // 让特殊命名的常见频道也能命中本地/公共库；频道显示名不变。本地查找仍以显示名优先、规范名兜底。
-      const logoKey = logoMatchName(channelItem.name)
-      let logoUrl = findLocalLogo(channelItem.name)
-      if (!logoUrl && logoKey && logoKey !== channelItem.name) {
-        logoUrl = findLocalLogo(logoKey)
-      }
+      //   > 源自带台标（咪咕 pics / 模块官方 / m3u 手写）> 仓库内置台标（logo-pack/）
+      //   > 台标库兜底（用户自己配了才有，仅外部/内置/模块）> 空。
+      // 取图用「台标匹配名」做 key（issue #40），让特殊命名的常见频道也能命中本地/公共库；频道显示名不变。
+      // 开着托管时，后两级从已下载校验过的图里挑：源自带的坏了（404、不是图片）自动换库里的，
+      // 都没托管上时沿用原地址（与托管前一样），全都确认坏了就留空。
+      let logoUrl = localLogo(channelItem.name)
       if (!logoUrl) {
-        logoUrl = channelItem.pics?.highResolutionH || channelItem.logo || ""
-      }
-      if (!logoUrl && (isExternal || isBuiltIn || isExtractor) && externalLogoBase) {
-        // 有索引就只写库里真实存在的图（issue #124）：查不到写空串，让播放器出自己的占位图，
-        // 而不是一个必定 404 的地址（裂图）。景观/慢直播这类「频道名不是台名」的伪频道
-        // 天然查不到，正好自动留空。索引不可用时（首次没网/库改版）退回按名盲拼的老行为。
-        const libraryName = resolveLibraryLogo(channelItem.name, datas[i].name)
-        if (libraryName === null) {
-          logoUrl = `${externalLogoBase}${encodeURIComponent(logoKey || channelItem.name)}.png`
-        } else if (libraryName) {
-          logoUrl = `${externalLogoBase}${encodeURIComponent(libraryName)}.png`
-        }
+        const candidates = logoCandidates(channelItem, datas[i].name, isExternal || isBuiltIn || isExtractor)
+        logoUrl = enableLogoCache ? hostedLogoUrl(candidates) : (candidates[0]?.url || '')
       }
       
       // 内置源使用playURL字段，外部源与抓取模块使用url字段，咪咕源构造URL
@@ -371,6 +424,9 @@ async function updateTV(hours, options = {}) {
 
       // 记录实际进入播放列表的频道名，供 EPG 聚合配对
       playlistChannelNames.push(channelItem.name)
+      if (isExtractor) {
+        moduleEpgChannels.push({ ref: channelItem.deferredRef, sourceId: channelItem.sourceId, name: channelItem.name })
+      }
 
       // 要不要为这个频道抓节目单，按**能力**判定而不是按源类型：
       // 默认只有咪咕（既不是外部也不是内置也不是模块）需要；但模块可以在频道上
@@ -380,7 +436,7 @@ async function updateTV(hours, options = {}) {
         || (!isExternal && !isBuiltIn && !isExtractor)
 
       // regenerateOnly模式下跳过playback更新（仅更新播放列表）
-      if (wantsPlayback && !regenerateOnly) {
+      if (wantsPlayback && !regenerateOnly && !epgOverrideKeys.has(normalizeKey(channelItem.name))) {
         // 单个频道的节目单抓不到，不该让整轮更新崩掉——这条链上（getPlaybackData →
         // updatePlaybackData → 这里）原本一个 try 都没有，节目单接口一次瞬时故障就会
         // 在第一个频道处抛出，其余一百多个频道的节目单一个都抓不到，本轮所有源的
@@ -400,7 +456,7 @@ async function updateTV(hours, options = {}) {
       // 咪咕频道无 sourceId、以 pID 隐式识别为 'migu'。播放器输出前会剥离该内部属性。
       const ownSourceId = channelItem.sourceId || (!isBuiltIn && !isExternal && !isExtractor ? 'migu' : '')
       const allSourceIds = [...new Set([ownSourceId, ...(channelItem.sourceIds || [])].filter(Boolean))]
-      // 多源用分号分隔——EXTINF 频道名按「第一个逗号」解析，属性值里出现逗号会破坏频道名提取
+      // 多源用分号分隔（早先回读按「第一个逗号」切频道名，属性值不能带逗号；沿用至今）
       const sourceAttr = allSourceIds.length ? ` source-ids="${allSourceIds.join(';')}"` : ''
 
       // 频道级播放选项：防盗链源要靠 #EXTVLCOPT 把 Referer 等带给播放器，
@@ -408,7 +464,9 @@ async function updateTV(hours, options = {}) {
       const optLines = renderOpts(channelItem.opts)
 
       // 写入节目
-      const catchupAttr = channelItem.catchup === 'none' ? ' catchup="none"' : ''
+      // 频道级回看声明：模块的 catchup:'none'（issue #119）与第三方订阅自带的模板 / 天数（issue #190），
+      // 行内覆盖订阅头的咪咕模板。没有声明时为空串，输出与之前逐字节一致。
+      const catchupAttr = renderCatchupAttrs(channelItem)
       appendFileSync(interfacePath, `#EXTINF:-1 tvg-id="${channelItem.name}" tvg-name="${channelItem.name}" tvg-logo="${logoUrl}"${sourceAttr}${catchupAttr} group-title="${datas[i].name}",${channelItem.name}\n${optLines}${playUrl}\n`)
       // txt：diyp/TVBox 格式只有「频道名,地址」两列，放不下请求头，依赖请求头的
       // 频道写进去必定 403——缺一个台好过一个死台，整条跳过。
@@ -424,6 +482,8 @@ async function updateTV(hours, options = {}) {
     printGreen(`分组:${datas[i].name} 更新完成！`)
   }
 
+  if (enableLogoCache) finishLogoCache()
+
   if (playbackFailed > 0) {
     printYellow(`节目单抓取失败 ${playbackFailed} 个频道（播放列表不受影响，这些频道本轮没有节目单）：${lastPlaybackError}`)
   }
@@ -434,9 +494,15 @@ async function updateTV(hours, options = {}) {
 
   // regenerateOnly模式下跳过playback文件生成
   if (!regenerateOnly) {
-    // EPG 聚合（issue #38）：为咪咕未覆盖的频道，从外部 XMLTV 源补节目单。失败不影响基础节目单。
+    // 模块自带的官方节目单：补咪咕没覆盖的模块频道。失败不影响基础节目单。
     try {
-      await aggregateExternalEpg(playbackFile, playlistChannelNames, epgCoveredKeys)
+      await appendModuleEpg(playbackFile, moduleEpgChannels, epgCoveredKeys, { skipKeys: epgOverrideKeys })
+    } catch (e) {
+      printYellow(`模块节目单失败（不影响基础节目单）: ${e.message}`)
+    }
+    // EPG 聚合（issue #38）：为仍未覆盖的频道，从外部 XMLTV 源补节目单。失败不影响基础节目单。
+    try {
+      await aggregateExternalEpg(playbackFile, playlistChannelNames, epgCoveredKeys, { overrideKeys: epgOverrideKeys })
     } catch (e) {
       printYellow(`EPG 聚合失败（不影响基础节目单）: ${e.message}`)
     }
@@ -505,6 +571,8 @@ async function updatePE(hours) {
   }
   printGreen("体育直播频道获取成功")
   // console.dir(datas, { depth: null })
+  // 直播弹幕的聊天室 ID 随赛事一起记（见 extractors/migu/danmaku.js）：整轮抓完才替换上一份
+  miguDanmaku.beginRound()
 
   copyFileSync(dataPath('interface.txt'), dataPath('interface.txt.bak'), 0)
   copyFileSync(dataPath('interfaceTXT.txt'), dataPath('interfaceTXT.txt.bak'), 0)
@@ -517,6 +585,10 @@ async function updatePE(hours) {
   // 单场赛事抓取失败的计数。收尾统一报一次，避免逐场刷屏。
   let matchFailed = 0
   let lastMatchError = ''
+  // 赛事名、队名、台标、pID 都来自咪咕接口（部分还是明文 http），带占位符 ${replace} 的场次不写：
+  // 输出时它会被换成带访问密码 / 令牌的本机地址（见 replaceToken.js）
+  let foreignTokenSkipped = 0
+  const hasForeignToken = (...parts) => parts.some(hasReplaceToken)
 
   // 缓存本次PE内容，供 regenerateOnly 模式使用
   let peM3uCache = ""
@@ -580,6 +652,10 @@ async function updatePE(hours) {
                 timeStr = peResultStartTimeStr.substring(11, 16)
               }
               const competitionDesc = `${data.competitionName} ${pkInfoTitle} ${replay.name} ${timeStr}`
+              if (hasForeignToken(pkInfoTitle, competitionDesc, data.competitionLogo, replay.pID)) {
+                foreignTokenSkipped++
+                continue
+              }
               const m3uLine = `#EXTINF:-1 tvg-id="${pkInfoTitle}" tvg-name="${competitionDesc}" tvg-logo="${data.competitionLogo}" source-ids="migu" group-title="体育-${relativeDate}",${competitionDesc}\n\${replace}/${replay.pID}\n`
               const txtLine = `${competitionDesc},\${replace}/${replay.pID}\n`
               // 写入赛事
@@ -598,8 +674,16 @@ async function updatePE(hours) {
             continue
           }
           const competitionDesc = `${data.competitionName} ${pkInfoTitle} ${live.name} ${live.startTimeStr.substring(11, 16)}`
+          if (hasForeignToken(pkInfoTitle, competitionDesc, data.competitionLogo, live.pID)) {
+            foreignTokenSkipped++
+            continue
+          }
           const m3uLine = `#EXTINF:-1 tvg-id="${pkInfoTitle}" tvg-name="${competitionDesc}" tvg-logo="${data.competitionLogo}" source-ids="migu" group-title="体育-${relativeDate}",${competitionDesc}\n\${replace}/${live.pID}\n`
           const txtLine = `${competitionDesc},\${replace}/${live.pID}\n`
+          // 聊天室 ID 只在 basic-data 里有；没有的场次（少数无聊天室的转播）就不带弹幕
+          if (peResult.body.roomId) {
+            miguDanmaku.recordRoom(live.pID, { roomId: peResult.body.roomId, title: competitionDesc, mgdbId: data.mgdbId, endTime: peResult.body.endTime })
+          }
           // 写入赛事
           appendFileSync(interfacePath, m3uLine)
           appendFileSync(interfaceTXTPath, txtLine)
@@ -616,6 +700,9 @@ async function updatePE(hours) {
     printGreen(`日期 ${date} 更新完成！`)
   }
 
+  // 聊天室记录与赛事缓存一起换代；快速模式恢复赛事缓存时沿用上次落盘的记录
+  miguDanmaku.commitRound()
+
   // 保存PE缓存，供 regenerateOnly 模式直接复用
   try {
     writeFileSync(PE_CACHE_PATH, JSON.stringify({ m3u: peM3uCache, txt: peTxtCache, updatedAt: new Date().toISOString() }), 'utf-8')
@@ -626,6 +713,9 @@ async function updatePE(hours) {
   // 重命名
   renameFileSync(interfacePath, interfacePath.replace(".bak", ""))
   renameFileSync(interfaceTXTPath, interfaceTXTPath.replace(".bak", ""))
+  if (foreignTokenSkipped > 0) {
+    printYellow(`体育赛事有 ${foreignTokenSkipped} 条带内部占位符 \${replace}，已跳过`)
+  }
   if (matchFailed > 0) {
     printYellow(`体育赛事有 ${matchFailed} 场抓取失败，本轮不含这些场次：${lastMatchError}`)
   }
