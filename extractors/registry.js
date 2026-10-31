@@ -25,7 +25,7 @@
  *                                 只有面向海外、在大陆连不上或常卡顿的模块写 false
  *                                 （海外频道、澳门），由用户自己打开；频道量大、只有本地少数人
  *                                 看的市县模块也可以（山东市县，两百来台按地市分组；市县台各省模块）；
- *                                 高校与场馆（institution）以点播录像为主、媒体全经本机转发，也一律默认关；各模块在海外的
+ *                                 高校与场馆（institution）以点播录像为主、媒体全经本机转发，也一律默认关；福建百视通以重复频道备用为主，按用户要求默认关；WebSports 来自第三方赛事网站，不进默认内容；各模块在海外的
  *                                 实测见仓库根目录 OVERSEAS.md。v4.29.0 及以前已有的模块
  *                                 在存量配置里多已落成 enabled:true，改它们的默认值要另写迁移
  *   capabilities          object  { cache: 'disk'|'memory'|'none',
@@ -45,6 +45,7 @@
  *   preserveGroupSuffixes array   可选；命中这些后缀的特殊分组不被 outputGroupName 覆盖
  *   channelHlsMode        string  可选；'proxy' 或 'relay'，在输出时覆盖频道缓存中的
  *                                 HLS 路由标记，适合整个平台统一要求代理的模块
+ *   channelHlsModeForConfig(config) 可选；按当前生效配置返回 'proxy'/'relay'，覆盖上面的固定模式
  *   relayProxyCompatible boolean 可选；true 表示模块的 relay 频道可被 `?relay=2`
  *                                 安全升级为全代理；默认不升级，避免破坏拒绝服务端分片的 CDN
  *   resolveBurstGuard     boolean 可选；true 表示播放请求经 utils/clientScanGuard.js 的客户端
@@ -81,6 +82,8 @@
  *
  *   async resolve(ref, ctx) → { url, desc, segmentTransform?, upstreamHeaders?,
  *                                upstreamUrlTransform?, manifestText?, manifestUrl? }
+ *       upstreamFamily 可选 4/6；显式直连该地址族，清单/子清单/分片/HEAD 共用，需同时要求 proxyHls。
+ *       proxyHls=true 可要求旧 relay 入口也转发媒体，供 IPv6 上游与 IPv4 播放器组合使用。
  *       可选，capabilities.resolve 为真时必需。用于「播放时才算地址」的模块：
  *       fetch() 里频道给 deferredRef，写盘时落成 ${replace}/<ref>，播放请求
  *       到达时才调 resolve。B 站不需要——它是直链。
@@ -171,10 +174,12 @@ import cztv from './cztv/index.js'
 import dalian from './dalian/index.js'
 import douyuLive from './douyu-live/index.js'
 import fjtv from './fjtv/index.js'
+import bestvFj from './bestv-fj/index.js'
 import fengshows from './fengshows/index.js'
 import gansu from './gansu/index.js'
 import gdtv from './gdtv/index.js'
 import gdsportEvents from './gdsport-events/index.js'
+import websports from './websports/index.js'
 import gztv from './gztv/index.js'
 import hangzhou from './hangzhou/index.js'
 import gzstv from './gzstv/index.js'
@@ -194,6 +199,7 @@ import jstv from './jstv/index.js'
 import jiaxing from './jiaxing/index.js'
 import taizhou from './taizhou/index.js'
 import shaoxing from './shaoxing/index.js'
+import zhejiangLocal from './zhejiang-local/index.js'
 import iqilu from './iqilu/index.js'
 import kankanews from './kankanews/index.js'
 import livechina from './livechina/index.js'
@@ -248,6 +254,7 @@ const MODULES = [
   douyinLive,
   huyaLive,
   douyuLive,
+  websports,
   anhui,
   beijing,
   chongqing,
@@ -262,6 +269,7 @@ const MODULES = [
   gzstv,
   gxtv,
   fjtv,
+  bestvFj,
   quanzhouMinnan,
   quanzhouCounty,
   putian,
@@ -279,6 +287,7 @@ const MODULES = [
   jiaxing,
   taizhou,
   shaoxing,
+  zhejiangLocal,
   jstv,
   wuxi,
   yangzhou,
@@ -341,6 +350,9 @@ export function validateModule(module) {
   }
   if (module.channelHlsMode != null && !['proxy', 'relay'].includes(module.channelHlsMode)) {
     throw new Error(`抓取模块 ${module.id} 的 channelHlsMode 非法: ${JSON.stringify(module.channelHlsMode)}`)
+  }
+  if (module.channelHlsModeForConfig != null && typeof module.channelHlsModeForConfig !== 'function') {
+    throw new Error(`抓取模块 ${module.id} 的 channelHlsModeForConfig 必须是函数`)
   }
   if (module.relayProxyCompatible != null && typeof module.relayProxyCompatible !== 'boolean') {
     throw new Error(`抓取模块 ${module.id} 的 relayProxyCompatible 必须是布尔值`)
